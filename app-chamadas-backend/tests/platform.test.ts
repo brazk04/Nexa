@@ -9,7 +9,7 @@ import { PrismaClient } from '@prisma/client';
 import { io as connect } from 'socket.io-client';
 import type { Socket } from 'socket.io-client';
 import { createPlatform } from '../src/platform';
-import type { ClientEvents, ServerEvents, History, Presence, RoomCall, Result, Message, Room, TypingUser } from '../../shared/protocol';
+import type { ClientEvents, ServerEvents, History, Presence, RoomCall, Result, Message, Room, RoomRemoved, TypingUser } from '../../shared/protocol';
 
 let folder: string;
 let prisma: PrismaClient;
@@ -118,6 +118,26 @@ test('salas são persistentes por usuário e acesso por ID é recusado para não
   sockets.push(unauthorized); const connected = event(unauthorized, 'connect'); unauthorized.connect(); await connected;
   const denied = await unauthorized.timeout(4000).emitWithAck('entrar_sala', { sala: room.id, requestId: randomUUID() });
   assert.equal(denied.ok, false); assert.equal(denied.ok ? '' : denied.code, 'ROOM_FORBIDDEN');
+});
+
+test('convidados saem da sala e proprietários excluem a sala para todos', async () => {
+  const alice = await account('AliceRooms'); const bob = await account('BrunoRooms'); const outsider = await account('CarlaRooms');
+  const room = await createRoom(alice.cookie, 'Sala removível');
+  await request('/rooms/join', { code: room.code }, bob.cookie);
+  const aliceSocket = await client(alice.cookie, room.id); const bobSocket = await client(bob.cookie, room.id);
+  assert.equal((await request(`/rooms/${room.id}`, undefined, outsider.cookie, 'DELETE')).status, 403);
+  const left = event<RoomRemoved>(bobSocket, 'sala_removida');
+  assert.equal((await request(`/rooms/${room.id}`, undefined, bob.cookie, 'DELETE')).status, 204);
+  assert.deepEqual(await left, { roomId: room.id, reason: 'left' });
+  assert.equal(await prisma.roomMember.count({ where: { roomId: room.id } }), 1);
+  assert.ok(await prisma.room.findUnique({ where: { id: room.id } }));
+  await request('/rooms/join', { code: room.code }, bob.cookie);
+  const deletedForGuest = event<RoomRemoved>(bobSocket, 'sala_removida');
+  const deletedForOwner = event<RoomRemoved>(aliceSocket, 'sala_removida');
+  assert.equal((await request(`/rooms/${room.id}`, undefined, alice.cookie, 'DELETE')).status, 204);
+  assert.deepEqual(await deletedForGuest, { roomId: room.id, reason: 'deleted' });
+  assert.deepEqual(await deletedForOwner, { roomId: room.id, reason: 'deleted' });
+  assert.equal(await prisma.room.findUnique({ where: { id: room.id } }), null);
 });
 
 test('chat e presença usam identidade autenticada e preservam histórico', async () => {

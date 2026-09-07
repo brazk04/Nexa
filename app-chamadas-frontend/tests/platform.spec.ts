@@ -6,12 +6,23 @@ interface InstrumentedWindow extends Window {
   __streams: MediaStream[];
   __displays: MediaStream[];
   __mediaRequests: { audio: boolean; video: boolean }[];
+  __notificationRequests: number;
+  __notifications: { title: string; body: string; tag: string }[];
   __releaseMedia?: () => void;
 }
 async function instrument(page: Page) {
   await page.addInitScript(() => {
     const target = window as unknown as InstrumentedWindow;
     target.__peers = []; target.__streams = []; target.__displays = []; target.__mediaRequests = [];
+    target.__notificationRequests = 0; target.__notifications = [];
+    class FakeNotification {
+      static permission: NotificationPermission = 'default';
+      static async requestPermission() { target.__notificationRequests += 1; FakeNotification.permission = 'granted'; return 'granted' as NotificationPermission; }
+      onclick: (() => void) | null = null;
+      constructor(title: string, options?: NotificationOptions) { target.__notifications.push({ title, body: options?.body ?? '', tag: options?.tag ?? '' }); }
+      close() { /* Test double. */ }
+    }
+    Object.defineProperty(window, 'Notification', { configurable: true, writable: true, value: FakeNotification });
     const NativePeer = window.RTCPeerConnection;
     window.RTCPeerConnection = class extends NativePeer {
       constructor(configuration?: RTCConfiguration) { super(configuration); target.__peers.push(this); }
@@ -97,6 +108,12 @@ test('cadastro verificado, salas por código, chat persistente, isolamento e log
     const bruno = await person(browser, 'BrunoWeb', { code, name: 'Projeto Alpha' }); contexts.push(bruno.context);
     const carla = await person(browser, 'CarlaWeb'); contexts.push(carla.context);
     await expect(alice.page.getByRole('region', { name: 'Pessoas online' }).getByText('BrunoWeb', { exact: true })).toBeVisible();
+    await alice.page.getByRole('button', { name: 'Ver perfil de BrunoWeb', exact: true }).click();
+    await expect(alice.page.getByRole('dialog').getByRole('heading', { name: 'BrunoWeb', exact: true })).toBeVisible();
+    await alice.page.getByRole('button', { name: 'Fechar perfil', exact: true }).click();
+    await alice.page.locator('.desktop-sidebar').getByLabel('Status de presença', { exact: true }).click();
+    await alice.page.locator('.desktop-sidebar').getByRole('button', { name: /Ocupado.*Pode demorar/ }).click();
+    await expect(alice.page.locator('.desktop-sidebar').getByLabel('Status de presença', { exact: true })).toContainText('Ocupado');
     await expect(carla.page.getByText('Projeto Alpha', { exact: true })).toHaveCount(0);
     const message = `Mensagem autenticada ${Date.now()}`;
     await alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true }).fill(message);
@@ -114,6 +131,40 @@ test('cadastro verificado, salas por código, chat persistente, isolamento e log
     await expect(bruno.page.getByRole('log').getByText(message, { exact: true })).toBeVisible();
     await bruno.page.getByRole('button', { name: 'Sair da conta', exact: true }).click();
     await expect(bruno.page.getByRole('heading', { name: 'Entre na sua conta.' })).toBeVisible();
+  } finally { await closeAll(contexts); }
+});
+
+test('notificações do computador, contador na aba e ações de sala', async ({ browser }) => {
+  const alice = await person(browser, 'AliceNotify'); const contexts = [alice.context];
+  try {
+    const firstCode = await createRoom(alice.page, 'Sala Alertas');
+    const bruno = await person(browser, 'BrunoNotify', { code: firstCode, name: 'Sala Alertas' }); contexts.push(bruno.context);
+    const secondCode = await createRoom(alice.page, 'Sala Atual');
+    await joinRoom(bruno.page, secondCode, 'Sala Atual');
+    await bruno.page.getByRole('button', { name: 'Ativar', exact: true }).click();
+    await expect.poll(() => bruno.page.evaluate(() => (window as unknown as InstrumentedWindow).__notificationRequests)).toBe(1);
+    await alice.page.locator('.desktop-sidebar .channel-item').filter({ hasText: 'Sala Alertas' }).click();
+    await alice.page.getByLabel('Mensagem para Sala Alertas', { exact: true }).fill('Mensagem para aparecer no computador');
+    await alice.page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
+    await expect.poll(() => bruno.page.evaluate(() => (window as unknown as InstrumentedWindow).__notifications)).toContainEqual({
+      title: 'Nova mensagem de AliceNotify', body: 'Mensagem para aparecer no computador', tag: expect.any(String),
+    });
+    await expect(bruno.page).toHaveTitle('(1) Nexa');
+    await expect(bruno.page.locator('.desktop-sidebar .channel-row').filter({ hasText: 'Sala Alertas' }).getByText('1', { exact: true })).toBeVisible();
+    await bruno.page.locator('.desktop-sidebar .channel-item').filter({ hasText: 'Sala Alertas' }).click();
+    await expect(bruno.page).toHaveTitle('Nexa');
+
+    await bruno.page.getByRole('button', { name: 'Convidar e organizar', exact: true }).click();
+    await bruno.page.getByRole('button', { name: 'Sala', exact: true }).click();
+    await bruno.page.getByRole('button', { name: 'Sair da sala', exact: true }).click();
+    await bruno.page.locator('.confirm-dialog').getByRole('button', { name: 'Sair da sala', exact: true }).click();
+    await expect(bruno.page.locator('.channel-item').filter({ hasText: 'Sala Alertas' })).toHaveCount(0);
+
+    await alice.page.getByRole('button', { name: 'Convidar e organizar', exact: true }).click();
+    await alice.page.getByRole('button', { name: 'Sala', exact: true }).click();
+    await alice.page.getByRole('button', { name: 'Excluir sala', exact: true }).click();
+    await alice.page.locator('.confirm-dialog').getByRole('button', { name: 'Excluir definitivamente', exact: true }).click();
+    await expect(alice.page.locator('.channel-item').filter({ hasText: 'Sala Alertas' })).toHaveCount(0);
   } finally { await closeAll(contexts); }
 });
 

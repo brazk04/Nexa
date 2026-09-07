@@ -1,7 +1,9 @@
+import { useRef, useState } from 'react';
 import type { AuthUser, OnlineUser, PresenceStatus, Room } from '../../../shared/protocol';
 import { Avatar } from './Avatar';
 import { Icon } from './Icon';
 import { NexaLogo } from './NexaLogo';
+import { UserProfileDialog } from './UserProfileDialog';
 
 interface Props {
   sala: string | null; rooms: Room[]; loading?: boolean; user: AuthUser; users: OnlineUser[]; selfId?: string; connected: boolean;
@@ -10,6 +12,8 @@ interface Props {
 }
 
 export function Sidebar({ sala, rooms, loading, user: account, users, selfId, connected, status, onStatus, onFavorite, onRoom, onCreate, onJoin, onSettings, onLogout, onClose }: Props) {
+  const statusMenu = useRef<HTMLDetailsElement>(null);
+  const [profile, setProfile] = useState<OnlineUser | null>(null);
   const favorites = rooms.filter(room => room.favorite);
   const channels = rooms.filter(room => !room.favorite);
   const renderRoom = (room: Room) => <RoomRow key={room.id} room={room} active={room.id === sala} onRoom={onRoom} onFavorite={onFavorite} />;
@@ -23,10 +27,11 @@ export function Sidebar({ sala, rooms, loading, user: account, users, selfId, co
         {channels.map(renderRoom)}
       </section>
       <div className="room-shortcuts"><button onClick={onCreate}><Icon name="plus" size={16} />Criar sala</button><button onClick={onJoin}><Icon name="enter" size={16} />Entrar com código</button></div></nav>
-      {sala && <section className="online-section" aria-label="Pessoas online"><h2><span>Nesta sala</span><span className="count">{users.length}</span></h2>{!users.length && <p className="muted sidebar-empty">{connected ? 'Ninguém online por aqui.' : 'Aguardando conexão…'}</p>}<ul className="online-list">{users.map(person => <li key={person.userId}><Avatar name={person.displayName} url={person.avatarUrl} small /><span className="online-name"><strong>{person.displayName}{person.socketId === selfId && <small> você</small>}</strong><small>{person.inCall ? 'Na chamada' : statusLabel(person.status)}</small></span><span className={`presence-dot status-${person.status}`} /></li>)}</ul></section>}
+      {sala && <section className="online-section" aria-label="Pessoas online"><h2><span>Nesta sala</span><span className="count">{users.length}</span></h2>{!users.length && <p className="muted sidebar-empty">{connected ? 'Ninguém online por aqui.' : 'Aguardando conexão…'}</p>}<ul className="online-list">{users.map(person => <li key={person.userId}><button className="online-user-button" aria-label={`Ver perfil de ${person.displayName}`} onClick={() => setProfile(person)}><Avatar name={person.displayName} url={person.avatarUrl} small /><span className="online-name"><strong>{person.displayName}{person.socketId === selfId && <small> você</small>}</strong><small>{person.inCall ? 'Na chamada' : statusLabel(person.status)}</small></span><span className={`presence-dot status-${person.status}`} /></button></li>)}</ul></section>}
       <div className="sidebar-note"><Icon name="video" size={17} /><p>Cada sala reúne conversa, presença e chamadas em grupo.</p></div>
     </div>
-    <div className="profile"><Avatar name={account.displayName} url={account.avatarUrl} small /><span><strong>{account.displayName}</strong><select aria-label="Status de presença" value={status} onChange={event => onStatus(event.target.value as PresenceStatus)}><option value="online">Online</option><option value="busy">Ocupado</option><option value="dnd">Não perturbe</option><option value="away">Ausente</option></select></span><button className="icon-button" onClick={onSettings} aria-label="Configurações" data-tooltip="Configurações"><Icon name="settings" size={18} /></button><button className="icon-button" aria-label="Sair da conta" onClick={onLogout} data-tooltip="Sair"><Icon name="logout" size={17} /></button></div>
+    <div className="profile"><Avatar name={account.displayName} url={account.avatarUrl} small /><span><strong>{account.displayName}</strong><details className="status-menu" ref={statusMenu}><summary aria-label="Status de presença"><span className={`presence-dot status-${status}`} />{statusLabel(status)}<Icon name="chevron" size={13} /></summary><div className="status-options">{statusOptions.map(option => <button type="button" className={status === option.value ? 'is-active' : ''} key={option.value} onClick={() => { onStatus(option.value); statusMenu.current?.removeAttribute('open'); }}><span className={`presence-dot status-${option.value}`} /><span><strong>{option.label}</strong><small>{option.description}</small></span>{status === option.value && <Icon name="check" size={15} />}</button>)}</div></details></span><button className="icon-button" onClick={onSettings} aria-label="Configurações" data-tooltip="Configurações"><Icon name="settings" size={18} /></button><button className="icon-button" aria-label="Sair da conta" onClick={onLogout} data-tooltip="Sair"><Icon name="logout" size={17} /></button></div>
+    {profile && <UserProfileDialog person={profile} self={profile.socketId === selfId} onClose={() => setProfile(null)} />}
   </div>;
 }
 
@@ -35,3 +40,9 @@ function RoomRow({ room, active, onRoom, onFavorite }: { room: Room; active: boo
 }
 
 function statusLabel(status: PresenceStatus) { return status === 'busy' ? 'Ocupado' : status === 'dnd' ? 'Não perturbe' : status === 'away' ? 'Ausente' : 'Disponível'; }
+const statusOptions: { value: PresenceStatus; label: string; description: string }[] = [
+  { value: 'online', label: 'Disponível', description: 'Pronto para conversar' },
+  { value: 'busy', label: 'Ocupado', description: 'Pode demorar para responder' },
+  { value: 'dnd', label: 'Não perturbe', description: 'Silencia as notificações' },
+  { value: 'away', label: 'Ausente', description: 'Longe do computador' },
+];

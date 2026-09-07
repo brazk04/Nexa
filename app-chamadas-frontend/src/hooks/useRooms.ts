@@ -38,6 +38,10 @@ export function useRooms() {
   const markRead = useCallback((roomId: string) => { patchRoom(roomId, { unreadCount: 0, mentionCount: 0 }); void api(`/rooms/${roomId}/read`, { method: 'POST' }); }, [patchRoom]);
   const notify = useCallback((roomId: string, mention: boolean) => setRooms(current => current.map(room => room.id === roomId
     ? { ...room, unreadCount: room.unreadCount + 1, mentionCount: room.mentionCount + (mention ? 1 : 0) } : room)), []);
+  const removeRoom = useCallback((roomId: string) => {
+    const next = rooms.filter(room => room.id !== roomId);
+    setRooms(next); setSelectedId(current => current === roomId ? next[0]?.id ?? null : current);
+  }, [rooms]);
   return { rooms, selectedId, selected: rooms.find(room => room.id === selectedId) ?? null, loading, error, setSelectedId, createRoom, joinRoom,
-    updateRoom, favoriteRoom, notifyRoom, markRead, notify, patchRoom, reload: load };
+    updateRoom, favoriteRoom, notifyRoom, markRead, notify, removeRoom, patchRoom, reload: load };
 }

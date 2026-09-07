@@ -37,6 +37,7 @@ export interface Presence { sala: string; users: OnlineUser[] }
 export interface CallReaction { id: string; sala: string; callId: string; userId: string; username: string; displayName: string; emoji: string; createdAt: string }
 export interface RoomNotification { roomId: string; messageId: number; mention: boolean; author: string; preview: string }
 export interface CallNotification { roomId: string; callId: string; startedBy: string }
+export interface RoomRemoved { roomId: string; reason: 'deleted' | 'left' }
 export interface TypingUser { userId: string; displayName: string }
 export type Result<T = undefined> = { ok: true; data: T } | { ok: false; error: string; code?: string };
 export type Ack<T = undefined> = (result: Result<T>) => void;
@@ -70,6 +71,7 @@ export interface ServerEvents {
   usuarios_online: (presence: Presence) => void;
   sala_notificada: (notification: RoomNotification) => void;
   chamada_notificada: (notification: CallNotification) => void;
+  sala_removida: (event: RoomRemoved) => void;
   usuarios_digitando: (event: { sala: string; users: TypingUser[] }) => void;
   chamada_atualizada: (call: RoomCall) => void;
   reacao_chamada: (reaction: CallReaction) => void;

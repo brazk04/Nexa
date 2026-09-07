@@ -737,6 +737,43 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     return prisma.mensagem.findUniqueOrThrow({ where: { id: messageId }, include: messageInclude });
   }
 
+  async function removeClientFromRoom(socket: ClientSocket, roomId: string) {
+    if (socket.data.sala !== roomId) return;
+    leaveCall(socket, 'room-change'); stopTyping(socket, roomId);
+    await socket.leave(channelKey(roomId));
+    socket.data.sala = undefined; socket.data.joining = false; socket.data.revision += 1;
+  }
+
+  app.delete('/rooms/:id', requireAuth, async (request, response) => {
+    const roomId = routeId(request.params.id);
+    const userId = getAuth(request).user.id;
+    const room = await prisma.room.findUnique({
+      where: { id: roomId },
+      select: {
+        createdById: true,
+        members: { select: { userId: true } },
+        messages: { select: { attachments: { select: { storedName: true } } } },
+      },
+    });
+    if (!room || !room.members.some(member => member.userId === userId)) {
+      response.status(403).json({ error: 'Você não tem acesso a esta sala.' }); return;
+    }
+    if (room.createdById === userId) {
+      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.sala === roomId);
+      await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
+      await prisma.room.delete({ where: { id: roomId } });
+      await Promise.all(room.messages.flatMap(message => message.attachments).map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
+      for (const member of room.members) io.to(userKey(member.userId)).emit('sala_removida', { roomId, reason: 'deleted' });
+    } else {
+      await prisma.roomMember.delete({ where: { userId_roomId: { userId, roomId } } });
+      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId && socket.data.sala === roomId);
+      await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
+      io.to(userKey(userId)).emit('sala_removida', { roomId, reason: 'left' });
+      presence(roomId);
+    }
+    response.status(204).end();
+  });
+
   app.post('/rooms/:id/attachments', requireAuth, upload.single('file'), async (request, response) => {
     const roomId = routeId(request.params.id);
     const member = await memberFor(request, roomId);

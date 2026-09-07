@@ -23,8 +23,9 @@ export function readCookie(header: string | undefined, name: string) {
   return undefined;
 }
 
-export async function sessionUser(prisma: PrismaClient, cookieHeader: string | undefined) {
-  const raw = readCookie(cookieHeader, SESSION_COOKIE);
+export async function sessionUser(prisma: PrismaClient, cookieHeader: string | undefined, authorization?: string) {
+  const bearer = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+  const raw = bearer || readCookie(cookieHeader, SESSION_COOKIE);
   if (!raw) return null;
   const session = await prisma.session.findUnique({ where: { id: tokenHash(raw) }, include: { user: true } });
   if (!session || session.expiresAt <= new Date() || !session.user.emailVerifiedAt) {
@@ -49,6 +50,7 @@ export async function createSession(prisma: PrismaClient, user: User, response: 
   // Cross-site credentialed fetches require SameSite=None; Secure in production.
   const sameSite = secure && process.env.COOKIE_SAME_SITE?.toLowerCase() !== 'lax' ? 'None' : 'Lax';
   response.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(raw)}; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}${secure}`);
+  return raw;
 }
 
 export function clearSessionCookie(response: Response) {

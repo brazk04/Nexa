@@ -9,10 +9,11 @@ export class ApiError extends Error {
 
 export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   const jsonBody = init.body && !(init.body instanceof FormData);
+  const sessionToken = localStorage.getItem('nexa-session-token');
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
     credentials: 'include',
-    headers: { ...(jsonBody ? { 'Content-Type': 'application/json' } : {}), ...init.headers },
+    headers: { ...(jsonBody ? { 'Content-Type': 'application/json' } : {}), ...(sessionToken ? { Authorization: `Bearer ${sessionToken}` } : {}), ...init.headers },
   });
   if (response.status === 204) return undefined as T;
   const data = await response.json().catch(() => ({})) as { error?: string; code?: string } & T;

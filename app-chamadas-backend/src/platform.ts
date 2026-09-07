@@ -42,6 +42,7 @@ const userKey = (userId: string) => `user:${userId}`;
 const normalize = (value: string) => value.normalize('NFC').toLocaleLowerCase('pt-BR');
 const routeId = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] ?? '' : value ?? '';
 const avatarUrl = (user: { id: string; avatarPath: string | null; updatedAt: Date }) => user.avatarPath ? `/users/${user.id}/avatar?v=${user.updatedAt.getTime()}` : null;
+const inlineAvatar = (value: string | null) => Boolean(value?.startsWith('data:image/'));
 const messageInclude = {
   user: { select: { id: true, username: true, displayName: true, avatarPath: true, updatedAt: true } },
   replyTo: { select: { id: true, autor: true, texto: true, deletedAt: true } },
@@ -182,7 +183,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   }
   const requireAuth = async (request: express.Request, response: express.Response, next: express.NextFunction) => {
     try {
-      const auth = await sessionUser(prisma, request.headers.cookie);
+      const auth = await sessionUser(prisma, request.headers.cookie, request.headers.authorization);
       if (!auth) { response.status(401).json({ error: 'Sua sessão expirou. Entre novamente.' }); return; }
       (request as express.Request & { auth: typeof auth }).auth = auth;
       next();
@@ -235,8 +236,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       if (!user.emailVerifiedAt) {
         response.status(403).json({ error: 'Verifique seu e-mail antes de entrar.', code: 'EMAIL_UNVERIFIED' }); return;
       }
-      await createSession(prisma, user, response, request);
-      response.json({ user: publicUser(user) });
+      const sessionToken = await createSession(prisma, user, response, request);
+      response.json({ user: publicUser(user), sessionToken });
     } catch (error) {
       console.error('Falha no login:', error instanceof Error ? error.message : 'erro desconhecido');
       response.status(500).json({ error: 'Não foi possível entrar agora.' });
@@ -259,8 +260,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         await transaction.emailVerificationToken.deleteMany({ where: { userId: record.userId } });
         return verified;
       });
-      if (record.purpose !== 'email-change') await createSession(prisma, user, response, request);
-      response.json({ user: publicUser(user) });
+      const sessionToken = record.purpose !== 'email-change' ? await createSession(prisma, user, response, request) : undefined;
+      response.json({ user: publicUser(user), ...(sessionToken ? { sessionToken } : {}) });
     } catch { response.status(400).json({ error: 'Link de verificação inválido ou expirado.' }); }
   });
 
@@ -293,12 +294,15 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       where: { userId }, include: { room: { select: roomSelect } },
       orderBy: [{ favorite: 'desc' }, { joinedAt: 'asc' }],
     });
-    const rooms = await Promise.all(memberships.map(async membership => {
-      const [unreadCount, mentionCount] = await Promise.all([
-        prisma.mensagem.count({ where: { roomId: membership.roomId, criadoEm: { gt: membership.lastReadAt }, userId: { not: userId }, deletedAt: null } }),
-        prisma.messageMention.count({ where: { userId, message: { roomId: membership.roomId, criadoEm: { gt: membership.lastReadAt }, deletedAt: null } } }),
-      ]);
-      return formatRoom(membership.room, membership, { unreadCount, mentionCount });
+    const unreadWhere = { deletedAt: null, OR: memberships.map(member => ({ roomId: member.roomId, criadoEm: { gt: member.lastReadAt } })) };
+    const [unread, mentions] = memberships.length ? await Promise.all([
+      prisma.mensagem.groupBy({ by: ['roomId'], where: { ...unreadWhere, userId: { not: userId } }, _count: true }),
+      prisma.mensagem.groupBy({ by: ['roomId'], where: { ...unreadWhere, mentions: { some: { userId } } }, _count: true }),
+    ]) : [[], []];
+    const unreadCounts = new Map(unread.map(item => [item.roomId, item._count]));
+    const mentionCounts = new Map(mentions.map(item => [item.roomId, item._count]));
+    const rooms = memberships.map(membership => formatRoom(membership.room, membership, {
+      unreadCount: unreadCounts.get(membership.roomId) ?? 0, mentionCount: mentionCounts.get(membership.roomId) ?? 0,
     }));
     response.json({ rooms });
   });
@@ -432,7 +436,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       await transaction.user.delete({ where: { id: user.id } });
     });
     await Promise.all(ownedFiles.map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
-    if (user.avatarPath) await unlink(join(avatarDirectory, basename(user.avatarPath))).catch(() => undefined);
+    if (user.avatarPath && !inlineAvatar(user.avatarPath)) await unlink(join(avatarDirectory, basename(user.avatarPath))).catch(() => undefined);
     clearSessionCookie(response); response.status(204).end();
   });
 
@@ -440,24 +444,33 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     const file = request.file;
     const extension = file ? imageExtension(file.buffer) : null;
     if (!file || !extension || file.size > 2 * 1024 * 1024) { response.status(400).json({ error: 'Envie uma imagem PNG, JPEG, WebP ou GIF de até 2 MB.' }); return; }
-    const storedName = `${randomUUID()}${extension}`;
-    await writeFile(join(avatarDirectory, storedName), file.buffer, { flag: 'wx' });
+    const mimeType = extension === '.jpg' ? 'image/jpeg' : `image/${extension.slice(1)}`;
+    // Keep avatars in the database so Vercel's ephemeral filesystem cannot
+    // make a profile image disappear after a new function instance starts.
+    const storedName = `data:${mimeType};base64,${file.buffer.toString('base64')}`;
     const previous = getAuth(request).user.avatarPath;
     const user = await prisma.user.update({ where: { id: getAuth(request).user.id }, data: { avatarPath: storedName } });
-    if (previous) await unlink(join(avatarDirectory, basename(previous))).catch(() => undefined);
+    if (previous && !inlineAvatar(previous)) await unlink(join(avatarDirectory, basename(previous))).catch(() => undefined);
     response.json({ user: publicUser(user) });
   });
   app.delete('/account/avatar', requireAuth, async (request, response) => {
     const previous = getAuth(request).user.avatarPath;
     const user = await prisma.user.update({ where: { id: getAuth(request).user.id }, data: { avatarPath: null } });
-    if (previous) await unlink(join(avatarDirectory, basename(previous))).catch(() => undefined);
+    if (previous && !inlineAvatar(previous)) await unlink(join(avatarDirectory, basename(previous))).catch(() => undefined);
     response.json({ user: publicUser(user) });
   });
   app.get('/users/:id/avatar', requireAuth, async (request, response) => {
     const user = await prisma.user.findUnique({ where: { id: routeId(request.params.id) }, select: { avatarPath: true } });
     if (!user?.avatarPath) { response.status(404).end(); return; }
-    const file = join(avatarDirectory, basename(user.avatarPath));
-    try { response.type(extname(file)).setHeader('Cache-Control', 'private, max-age=86400'); response.send(await readFile(file)); }
+    try {
+      if (inlineAvatar(user.avatarPath)) {
+        const match = user.avatarPath.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i);
+        if (!match) { response.status(404).end(); return; }
+        response.type(match[1]!).setHeader('Cache-Control', 'private, max-age=86400, immutable').send(Buffer.from(match[2]!, 'base64')); return;
+      }
+      const file = join(avatarDirectory, basename(user.avatarPath));
+      response.type(extname(file)).setHeader('Cache-Control', 'private, max-age=86400').send(await readFile(file));
+    }
     catch { response.status(404).end(); }
   });
 
@@ -630,7 +643,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   const typing = new Map<string, Set<string>>();
   io.use(async (socket, next) => {
     try {
-      const auth = await sessionUser(prisma, socket.handshake.headers.cookie);
+      const auth = await sessionUser(prisma, socket.handshake.headers.cookie, typeof socket.handshake.auth?.token === 'string' ? `Bearer ${socket.handshake.auth.token}` : undefined);
       if (!auth) { next(new Error('unauthorized')); return; }
       socket.data.userId = auth.user.id;
       socket.data.username = auth.user.username;
@@ -1039,7 +1052,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         }
         if (changed) affectedRooms.add(roomId);
       }
-      for (const roomId of affectedRooms) broadcastCall(roomId);
+      for (const roomId of affectedRooms) { broadcastCall(roomId); presence(roomId); }
     });
     socket.on('webrtc_offer', (data: unknown) => {
       const target = signalTarget(socket, data);

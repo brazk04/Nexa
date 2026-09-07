@@ -9,6 +9,7 @@ export function createSocket(): AppSocket {
   return io(url, {
     autoConnect: false,
     withCredentials: true,
+    auth: { token: localStorage.getItem('nexa-session-token') || undefined },
     ...(websocketOnly ? { transports: ['websocket'] as const } : {}),
   });
 }

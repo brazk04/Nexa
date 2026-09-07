@@ -45,12 +45,14 @@ export async function createSession(prisma: PrismaClient, user: User, response: 
     userAgent: request?.get('user-agent')?.slice(0, 500), ipAddress: request?.ip?.slice(0, 100),
   } });
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  response.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(raw)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}${secure}`);
+  const sameSite = process.env.COOKIE_SAME_SITE?.toLowerCase() === 'none' && secure ? 'None' : 'Lax';
+  response.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(raw)}; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}${secure}`);
 }
 
 export function clearSessionCookie(response: Response) {
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  response.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0${secure}`);
+  const sameSite = process.env.COOKIE_SAME_SITE?.toLowerCase() === 'none' && secure ? 'None' : 'Lax';
+  response.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=0${secure}`);
 }
 
 export interface AuthenticatedRequest extends Request { auth?: { sessionId: string; user: User } }

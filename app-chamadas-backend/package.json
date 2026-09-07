@@ -10,7 +10,9 @@
     "start": "node dist/app-chamadas-backend/server.js",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate deploy",
+    "db:push:postgres": "node scripts/postgres-schema.cjs push",
     "dev": "tsx watch server.ts",
+    "vercel-build": "node scripts/postgres-schema.cjs generate && npm run build",
     "postinstall": "prisma generate"
   },
   "keywords": [],

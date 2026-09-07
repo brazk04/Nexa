@@ -170,6 +170,8 @@ test('chamada mesh aceita 15, recusa o 16º, roteia sinais e remove somente quem
   const calls = [];
   for (let index = 0; index < 15; index += 1) calls.push(await call(clients[index], room.id));
   assert.equal(calls[14].data.participants.length, 15);
+  assert.equal(calls[0].data.participants[0]?.microphone, false);
+  assert.equal(calls[0].data.participants[0]?.camera, false);
   const full = await clients[15].timeout(4000).emitWithAck('entrar_chamada', { sala: room.id, attemptId: randomUUID() });
   assert.equal(full.ok, false); assert.equal(full.ok ? '' : full.code, 'CALL_FULL');
   const offer = event<{ from: string }>(clients[1], 'webrtc_offer');

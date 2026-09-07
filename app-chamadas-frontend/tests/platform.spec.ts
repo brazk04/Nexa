@@ -5,12 +5,13 @@ interface InstrumentedWindow extends Window {
   __peers: RTCPeerConnection[];
   __streams: MediaStream[];
   __displays: MediaStream[];
+  __mediaRequests: { audio: boolean; video: boolean }[];
   __releaseMedia?: () => void;
 }
 async function instrument(page: Page) {
   await page.addInitScript(() => {
     const target = window as unknown as InstrumentedWindow;
-    target.__peers = []; target.__streams = []; target.__displays = [];
+    target.__peers = []; target.__streams = []; target.__displays = []; target.__mediaRequests = [];
     const NativePeer = window.RTCPeerConnection;
     window.RTCPeerConnection = class extends NativePeer {
       constructor(configuration?: RTCConfiguration) { super(configuration); target.__peers.push(this); }
@@ -24,13 +25,18 @@ async function instrument(page: Page) {
       track.stop = () => { window.clearInterval(timer); nativeStop(); };
       return stream;
     };
-    navigator.mediaDevices.getUserMedia = async () => {
-      const video = videoStream('#5b3ca0');
-      const audioContext = new AudioContext(); const oscillator = audioContext.createOscillator(); const destination = audioContext.createMediaStreamDestination();
-      oscillator.connect(destination); oscillator.start();
-      const audio = destination.stream.getAudioTracks()[0]; const nativeStop = audio.stop.bind(audio);
-      audio.stop = () => { oscillator.stop(); void audioContext.close(); nativeStop(); };
-      const stream = new MediaStream([...video.getVideoTracks(), audio]); target.__streams.push(stream); return stream;
+    navigator.mediaDevices.getUserMedia = async (constraints = {}) => {
+      target.__mediaRequests.push({ audio: Boolean(constraints.audio), video: Boolean(constraints.video) });
+      const tracks: MediaStreamTrack[] = [];
+      if (constraints.video) tracks.push(...videoStream('#5b3ca0').getVideoTracks());
+      if (constraints.audio) {
+        const audioContext = new AudioContext(); const oscillator = audioContext.createOscillator(); const destination = audioContext.createMediaStreamDestination();
+        oscillator.connect(destination); oscillator.start();
+        const audio = destination.stream.getAudioTracks()[0]; const nativeStop = audio.stop.bind(audio);
+        audio.stop = () => { oscillator.stop(); void audioContext.close(); nativeStop(); };
+        tracks.push(audio);
+      }
+      const stream = new MediaStream(tracks); target.__streams.push(stream); return stream;
     };
     navigator.mediaDevices.getDisplayMedia = async () => {
       const stream = videoStream('#145c50'); target.__displays.push(stream); return stream;
@@ -120,6 +126,15 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await alice.page.getByRole('button', { name: 'Iniciar chamada', exact: true }).click();
     await bruno.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
     await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(bruno.page, 1);
+    expect(await alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
+    expect(await bruno.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
+    await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
+    await expect(alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true })).toBeEnabled();
+    await alice.page.getByRole('button', { name: 'Ligar câmera', exact: true }).click();
+    await expect(alice.page.getByRole('button', { name: 'Desligar câmera', exact: true })).toBeEnabled();
+    expect(await alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([
+      { audio: true, video: false }, { audio: false, video: true },
+    ]);
     await alice.page.getByRole('button', { name: 'Levantar a mão', exact: true }).click();
     await bruno.page.getByRole('button', { name: 'Abrir participantes', exact: true }).click();
     await expect(bruno.page.locator('.participants-panel').getByText('Mão levantada', { exact: true })).toBeVisible();
@@ -172,7 +187,11 @@ test('cancelar enquanto a permissão está pendente não deixa tracks ou peers �
   });
   await signup(page, 'DianaCall'); await createRoom(page, 'Sala Diana');
   await page.getByRole('button', { name: 'Iniciar chamada', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Ligar câmera', exact: true })).toBeEnabled();
+  expect(await page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
+  await page.getByRole('button', { name: 'Ligar câmera', exact: true }).click();
   await expect.poll(() => page.evaluate(() => Boolean((window as unknown as InstrumentedWindow).__releaseMedia))).toBe(true);
+  expect(await page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([{ audio: false, video: true }]);
   await page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
   await page.evaluate(() => (window as unknown as InstrumentedWindow).__releaseMedia?.());
   await expectStopped(page);

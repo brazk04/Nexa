@@ -941,7 +941,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       call.participants.set(socket.id, {
         socketId: socket.id, userId: socket.data.userId, username: socket.data.username,
         displayName: socket.data.displayName, avatarUrl: socket.data.avatarUrl, status: socket.data.status, inCall: true,
-        microphone: true, camera: true, screen: false, attemptId: data.attemptId,
+        microphone: false, camera: false, screen: false, attemptId: data.attemptId,
         handRaisedAt: null,
       });
       if (typeof ack === 'function') ack({ ok: true, data: snapshot(sala) });

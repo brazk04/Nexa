@@ -11,6 +11,8 @@ export interface CallState extends MediaState {
   reactions: CallReaction[];
   ecoMode: boolean;
   quality: 'high' | 'medium' | 'low';
+  microphoneBusy: boolean;
+  cameraBusy: boolean;
   sharingBusy: boolean;
   notice: string;
   error: string;
@@ -19,6 +21,7 @@ interface PeerContext {
   connection: RTCPeerConnection;
   candidates: IceCandidate[];
   chain: Promise<void>;
+  audioSender: RTCRtpSender;
   videoSender: RTCRtpSender | null;
   disconnectTimer: ReturnType<typeof setTimeout> | null;
   handshakeTimer: ReturnType<typeof setTimeout> | null;
@@ -26,8 +29,18 @@ interface PeerContext {
 const idleState = (): CallState => ({
   phase: 'idle', localStream: null, remoteStreams: {}, participants: [], startedAt: null,
   reactions: [], ecoMode: false, quality: 'high',
-  microphone: true, camera: true, screen: false, sharingBusy: false, notice: '', error: '',
+  microphone: false, camera: false, screen: false,
+  microphoneBusy: false, cameraBusy: false, sharingBusy: false, notice: '', error: '',
 });
+type UserMediaKind = 'camera' | 'microphone';
+function userMediaError(error: unknown, kind: UserMediaKind) {
+  const label = kind === 'camera' ? 'câmera' : 'microfone';
+  const name = error instanceof Error ? error.name : '';
+  if (name === 'NotAllowedError' || name === 'PermissionDeniedError') return `O acesso ao ${label} foi bloqueado. Permita-o nas configurações do navegador e tente novamente.`;
+  if (name === 'NotFoundError') return `${kind === 'camera' ? 'Câmera não encontrada' : 'Microfone não encontrado'}. Conecte o dispositivo e tente novamente.`;
+  if (name === 'NotReadableError') return `Não foi possível usar o ${label}. Feche outros aplicativos que possam estar usando o dispositivo.`;
+  return `Não foi possível ativar o ${label}. Confira o dispositivo e tente novamente.`;
+}
 function mediaError(error: unknown, display = false) {
   const name = error instanceof Error ? error.name : '';
   if (name === 'NotAllowedError' || name === 'PermissionDeniedError') return display
@@ -120,12 +133,16 @@ export class CallController {
     const existing = this.peers.get(peerId);
     if (existing) return existing;
     const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
-    const context: PeerContext = { connection, candidates: [], chain: Promise.resolve(), videoSender: null, disconnectTimer: null, handshakeTimer: null };
-    this.peers.set(peerId, context);
     const audioTrack = this.cameraStream?.getAudioTracks()[0];
-    if (audioTrack && this.cameraStream) connection.addTrack(audioTrack, this.cameraStream);
     const videoTrack = this.displayStream?.getVideoTracks()[0] ?? this.cameraStream?.getVideoTracks()[0];
-    if (videoTrack) context.videoSender = connection.addTrack(videoTrack, this.displayStream ?? this.cameraStream!);
+    const audioSender = connection.addTransceiver(audioTrack ?? 'audio', {
+      direction: 'sendrecv', streams: this.cameraStream ? [this.cameraStream] : [],
+    }).sender;
+    const videoSender = connection.addTransceiver(videoTrack ?? 'video', {
+      direction: 'sendrecv', streams: (this.displayStream ?? this.cameraStream) ? [this.displayStream ?? this.cameraStream!] : [],
+    }).sender;
+    const context: PeerContext = { connection, candidates: [], chain: Promise.resolve(), audioSender, videoSender, disconnectTimer: null, handshakeTimer: null };
+    this.peers.set(peerId, context);
     if (context.videoSender && this.state.ecoMode) void this.setSenderQuality(context.videoSender, 350_000, 2);
     connection.onicecandidate = event => {
       if (this.current(generation) && event.candidate) this.socket.emit('webrtc_ice_candidate', { ...this.target(peerId), candidate: event.candidate.toJSON() as IceCandidate });
@@ -194,14 +211,8 @@ export class CallController {
     this.room = sala; this.attemptId = crypto.randomUUID();
     this.update({ ...idleState(), phase: 'media' });
     try {
-      if (!navigator.mediaDevices?.getUserMedia) { this.fail('Use HTTPS ou localhost para permitir acesso à câmera e ao microfone.'); return; }
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: this.devices.microphoneId ? { deviceId: { exact: this.devices.microphoneId } } : true,
-        video: { width: { ideal: 1280 }, height: { ideal: 720 }, ...(this.devices.cameraId ? { deviceId: { exact: this.devices.cameraId } } : {}) },
-      });
-      if (!this.current(generation)) { stream.getTracks().forEach(track => track.stop()); return; }
+      const stream = new MediaStream();
       this.cameraStream = stream; this.update({ localStream: stream });
-      for (const track of stream.getTracks()) track.onended = () => { if (this.current(generation)) this.fail('Um dispositivo foi desconectado. Reconecte-o e entre novamente.'); };
       const result: Result<RoomCall> = await this.socket.timeout(10_000).emitWithAck('entrar_chamada', { sala, attemptId: this.attemptId });
       if (!this.current(generation)) return;
       if (!result.ok) { this.fail(result.error); return; }
@@ -212,20 +223,80 @@ export class CallController {
       remotes.forEach(remote => this.offerTo(remote.socketId));
     } catch (error) {
       console.error('Falha ao iniciar chamada:', error);
-      if (this.current(generation)) this.fail(this.cameraStream ? 'Não foi possível conectar a chamada. Verifique a conexão e tente novamente.' : mediaError(error));
+      if (this.current(generation)) this.fail('Não foi possível conectar a chamada. Verifique a conexão e tente novamente.');
     }
   };
-  toggleMicrophone = () => {
-    const tracks = this.cameraStream?.getAudioTracks() ?? [];
-    if (!tracks.length) return;
-    const microphone = !this.state.microphone;
-    tracks.forEach(track => { track.enabled = microphone; }); this.update({ microphone }); this.publishMedia();
+  private onDeviceEnded(kind: UserMediaKind, track: MediaStreamTrack, generation: number) {
+    if (!this.current(generation) || track.readyState !== 'ended') return;
+    this.cameraStream?.removeTrack(track);
+    if (kind === 'microphone') {
+      void Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(null))).catch(() => undefined);
+      this.update({ microphone: false, notice: 'O microfone foi desconectado.' });
+    } else {
+      if (!this.displayStream) void Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(null))).catch(() => undefined);
+      this.update({ camera: false, notice: 'A câmera foi desconectada.' });
+    }
+    this.publishMedia();
+  }
+  toggleMicrophone = async () => {
+    if (this.state.phase === 'idle' || this.state.microphoneBusy) return;
+    const currentTrack = this.cameraStream?.getAudioTracks()[0];
+    if (currentTrack) {
+      const microphone = !this.state.microphone;
+      currentTrack.enabled = microphone; this.update({ microphone }); this.publishMedia(); return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) { this.update({ error: 'Use HTTPS ou localhost para permitir acesso ao microfone.' }); return; }
+    const generation = this.generation;
+    this.update({ microphoneBusy: true, error: '' });
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: this.devices.microphoneId ? { deviceId: { exact: this.devices.microphoneId } } : true,
+        video: false,
+      });
+      if (!this.current(generation)) { stream.getTracks().forEach(track => track.stop()); return; }
+      const track = stream.getAudioTracks()[0];
+      if (!track) throw new DOMException('Microfone não encontrado.', 'NotFoundError');
+      for (const extra of stream.getTracks()) if (extra !== track) extra.stop();
+      this.cameraStream?.addTrack(track); track.onended = () => this.onDeviceEnded('microphone', track, generation);
+      await Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(track)));
+      if (!this.current(generation)) { track.onended = null; track.stop(); return; }
+      this.update({ microphone: true }); this.publishMedia();
+    } catch (error) {
+      stream?.getTracks().forEach(track => { this.cameraStream?.removeTrack(track); track.onended = null; track.stop(); });
+      await Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(null).catch(() => undefined)));
+      if (this.current(generation)) this.update({ error: userMediaError(error, 'microphone') });
+    } finally { if (this.current(generation)) this.update({ microphoneBusy: false }); }
   };
-  toggleCamera = () => {
-    const tracks = this.cameraStream?.getVideoTracks() ?? [];
-    if (!tracks.length) return;
-    const camera = !this.state.camera;
-    tracks.forEach(track => { track.enabled = camera; }); this.update({ camera }); this.publishMedia();
+  toggleCamera = async () => {
+    if (this.state.phase === 'idle' || this.state.cameraBusy) return;
+    const currentTrack = this.cameraStream?.getVideoTracks()[0];
+    if (currentTrack) {
+      const camera = !this.state.camera;
+      currentTrack.enabled = camera; this.update({ camera }); this.publishMedia(); return;
+    }
+    if (!navigator.mediaDevices?.getUserMedia) { this.update({ error: 'Use HTTPS ou localhost para permitir acesso à câmera.' }); return; }
+    const generation = this.generation;
+    this.update({ cameraBusy: true, error: '' });
+    let stream: MediaStream | null = null;
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { width: { ideal: 1280 }, height: { ideal: 720 }, ...(this.devices.cameraId ? { deviceId: { exact: this.devices.cameraId } } : {}) },
+      });
+      if (!this.current(generation)) { stream.getTracks().forEach(track => track.stop()); return; }
+      const track = stream.getVideoTracks()[0];
+      if (!track) throw new DOMException('Câmera não encontrada.', 'NotFoundError');
+      for (const extra of stream.getTracks()) if (extra !== track) extra.stop();
+      this.cameraStream?.addTrack(track); track.onended = () => this.onDeviceEnded('camera', track, generation);
+      if (!this.displayStream) await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(track)));
+      if (!this.current(generation)) { track.onended = null; track.stop(); return; }
+      this.update({ camera: true }); this.publishMedia();
+    } catch (error) {
+      stream?.getTracks().forEach(track => { this.cameraStream?.removeTrack(track); track.onended = null; track.stop(); });
+      if (!this.displayStream) await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(null).catch(() => undefined)));
+      if (this.current(generation)) this.update({ error: userMediaError(error, 'camera') });
+    } finally { if (this.current(generation)) this.update({ cameraBusy: false }); }
   };
   toggleHand = () => {
     const self = this.state.participants.find(item => item.socketId === this.socket.id);

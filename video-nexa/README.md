@@ -27,3 +27,9 @@ A pasta `telas/16x9` e `telas/9x16` contém uma imagem individual para cada tela
 ```bash
 node video-nexa/create-screen-prints.mjs
 ```
+
+As seções da landing também estão separadas em `telas/16x9/landing-secoes` e `telas/9x16/landing-secoes`: hero, funcionalidades, recursos, CTA final e rodapé. Para recriá-las:
+
+```bash
+node video-nexa/create-landing-sections.mjs
+```

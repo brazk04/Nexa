@@ -19,3 +19,11 @@ Para recriar os vídeos depois de substituir as imagens, execute na raiz do proj
 ```bash
 node video-nexa/create-videos.mjs
 ```
+
+## Prints separados
+
+A pasta `telas/16x9` e `telas/9x16` contém uma imagem individual para cada tela, já enquadrada nos formatos horizontal e vertical. Para recriá-las:
+
+```bash
+node video-nexa/create-screen-prints.mjs
+```

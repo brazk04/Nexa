@@ -72,7 +72,7 @@ export function AuthScreen({ login, register, verify, resend }: Props) {
     <section className="entry-content">
       <div className="entry-copy"><NexaLogo className="entry-hero-logo" />
         <span className="entry-eyebrow">Colaboração que mantém o foco</span>
-        <h1>O trabalho acontece<br />entre pessoas.</h1>
+        <h1>O trabalho acontece <br />entre pessoas.</h1>
         <p>Converse com sua equipe em salas privadas, compartilhe ideias e transforme uma conversa em chamada.</p>
         <div className="entry-capabilities" aria-label="Recursos principais"><span>Salas privadas</span><span>Chat em tempo real</span><span>Chamadas em grupo</span></div>
       </div>

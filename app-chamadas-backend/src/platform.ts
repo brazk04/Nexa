@@ -38,6 +38,7 @@ const VERIFY_DURATION_MS = 60 * 60 * 1000;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 100;
 const channelKey = (roomId: string) => `channel:${roomId}`;
+const presenceKey = (roomId: string) => `presence:${roomId}`;
 const userKey = (userId: string) => `user:${userId}`;
 const normalize = (value: string) => value.normalize('NFC').toLocaleLowerCase('pt-BR');
 const routeId = (value: string | string[] | undefined) => Array.isArray(value) ? value[0] ?? '' : value ?? '';
@@ -653,6 +654,11 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       socket.data.status = (preferences?.status ?? 'online') as PresenceStatus;
       socket.data.sessionId = auth.sessionId;
       socket.data.sessionCheckedAt = Date.now();
+      // Keep a lightweight presence membership for every room the user can
+      // access. This makes "Disponível" reflect an open Nexa session even
+      // when the user has not selected that room yet.
+      const memberships = await prisma.roomMember.findMany({ where: { userId: auth.user.id }, select: { roomId: true } });
+      for (const membership of memberships) await socket.join(presenceKey(membership.roomId));
       next();
     } catch { next(new Error('unauthorized')); }
   });
@@ -662,7 +668,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     return { sala, callId: call?.id ?? null, startedAt: call?.startedAt.toISOString() ?? null, participants: [...(call?.participants.values() ?? [])] };
   }
   function presence(sala: string) {
-    const ids = io.sockets.adapter.rooms.get(channelKey(sala)) ?? [];
+    const ids = io.sockets.adapter.rooms.get(presenceKey(sala)) ?? [];
     const unique = new Map<string, { userId: string; socketId: string; username: string; displayName: string; avatarUrl: string | null; status: PresenceStatus; inCall: boolean }>();
     for (const id of ids) {
       const client = io.sockets.sockets.get(id);
@@ -674,7 +680,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         avatarUrl: client.data.avatarUrl, status: client.data.status, inCall: inCall || previous?.inCall || false,
       });
     }
-    io.to(channelKey(sala)).emit('usuarios_online', { sala, users: [...unique.values()] });
+    io.to(presenceKey(sala)).emit('usuarios_online', { sala, users: [...unique.values()] });
   }
   function broadcastCall(sala: string) {
     io.to(channelKey(sala)).emit('chamada_atualizada', snapshot(sala));
@@ -754,6 +760,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     if (socket.data.sala !== roomId) return;
     leaveCall(socket, 'room-change'); stopTyping(socket, roomId);
     await socket.leave(channelKey(roomId));
+    await socket.leave(presenceKey(roomId));
     socket.data.sala = undefined; socket.data.joining = false; socket.data.revision += 1;
   }
 
@@ -774,6 +781,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     if (room.createdById === userId) {
       const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.sala === roomId);
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
+      await Promise.all([...io.sockets.sockets.values()].filter(socket => room.members.some(member => member.userId === socket.data.userId)).map(socket => socket.leave(presenceKey(roomId))));
       await prisma.room.delete({ where: { id: roomId } });
       await Promise.all(room.messages.flatMap(message => message.attachments).map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
       for (const member of room.members) io.to(userKey(member.userId)).emit('sala_removida', { roomId, reason: 'deleted' });
@@ -781,6 +789,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       await prisma.roomMember.delete({ where: { userId_roomId: { userId, roomId } } });
       const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId && socket.data.sala === roomId);
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
+      await Promise.all([...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId).map(socket => socket.leave(presenceKey(roomId))));
       io.to(userKey(userId)).emit('sala_removida', { roomId, reason: 'left' });
       presence(roomId);
     }
@@ -860,6 +869,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       if (previousRoom) await socket.leave(channelKey(previousRoom));
       socket.data.sala = sala;
       await socket.join(channelKey(sala));
+      await socket.join(presenceKey(sala));
       if (previousRoom) presence(previousRoom);
       presence(sala);
       socket.emit('chamada_atualizada', snapshot(sala));
@@ -1033,7 +1043,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       socket.data.status = data.status as PresenceStatus;
       await prisma.userPreference.upsert({ where: { userId: socket.data.userId }, create: { userId: socket.data.userId, status: socket.data.status }, update: { status: socket.data.status } });
       for (const client of io.sockets.sockets.values()) if (client.data.userId === socket.data.userId) client.data.status = socket.data.status;
-      if (socket.data.sala) presence(socket.data.sala);
+      for (const room of socket.rooms) if (room.startsWith('presence:')) presence(room.slice('presence:'.length));
     });
     socket.on('atualizar_perfil', async () => {
       const user = await prisma.user.findUnique({ where: { id: socket.data.userId } });
@@ -1043,7 +1053,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       for (const client of io.sockets.sockets.values()) {
         if (client.data.userId !== user.id) continue;
         client.data.displayName = displayName; client.data.avatarUrl = picture;
-        if (client.data.sala) affectedRooms.add(client.data.sala);
+        for (const room of client.rooms) if (room.startsWith('presence:')) affectedRooms.add(room.slice('presence:'.length));
       }
       for (const [roomId, call] of calls) {
         let changed = false;
@@ -1079,7 +1089,10 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       } });
     });
     socket.on('disconnecting', () => { leaveCall(socket, 'disconnected'); stopTyping(socket); });
-    socket.on('disconnect', () => { if (socket.data.sala) presence(socket.data.sala); });
+    socket.on('disconnecting', () => {
+      const affectedPresence = [...socket.rooms].filter(room => room.startsWith('presence:')).map(room => room.slice('presence:'.length));
+      setTimeout(() => { for (const roomId of affectedPresence) presence(roomId); }, 0);
+    });
   });
   app.use((error: unknown, _request: express.Request, response: express.Response, next: express.NextFunction) => {
     if (error instanceof multer.MulterError) { response.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'O arquivo deve ter no máximo 10 MB.' : 'Não foi possível processar o arquivo.' }); return; }

@@ -415,7 +415,7 @@ button, input, textarea, select { transition: border-color .16s ease, background
 .entry-atmosphere .mesh { position: absolute; width: min(54vw,700px); aspect-ratio: 1; border-radius: 50%; filter: blur(1px); opacity: .42; animation: mesh-float 18s ease-in-out infinite alternate; }
 .entry-atmosphere .mesh-one { right: -15%; top: -35%; background: radial-gradient(circle at 40% 45%, color-mix(in srgb,var(--accent) 32%,transparent), transparent 66%); }
 .entry-atmosphere .mesh-two { left: 20%; bottom: -60%; background: radial-gradient(circle, color-mix(in srgb,var(--success) 13%,transparent), transparent 65%); animation-delay: -8s; }
-.entry-atmosphere i { position: absolute; left: calc(4% + var(--particle) * 9%); top: calc(8% + var(--particle) * 7%); width: 3px; height: 3px; border-radius: 50%; background: var(--focus); opacity: .24; animation: particle-drift 9s ease-in-out infinite alternate; animation-delay: calc(var(--particle) * -.7s); }
+.entry-atmosphere i { position: absolute; left: calc(4% + var(--particle) * 9%); top: calc(8% + var(--particle) * 7%); width: 3px; height: 3px; border-radius: 50%; background: var(--focus); opacity: .24; animation: particle-drift 7s ease-in-out infinite alternate; animation-delay: calc(var(--particle) * -.7s); }
 .entry-atmosphere i:nth-of-type(3n) { width: 2px; height: 2px; }
 .entry-atmosphere i:nth-of-type(3n + 1) { top: calc(78% - var(--particle) * 5%); }
 .entry-page.is-background-paused .entry-atmosphere * { animation-play-state: paused; }
@@ -674,6 +674,11 @@ select { appearance: none; padding-right: 32px !important; background-image: lin
 .notification-consent small { color: var(--text-secondary); font-size: 10px; line-height: 1.4; }
 .notification-consent .primary-button { min-height: 36px; padding: 8px 12px; }
 .notification-consent > .icon-button { width: 32px; height: 32px; }
+.app-install-offer { border-color: color-mix(in srgb,var(--success) 38%,var(--border)); background: color-mix(in srgb,var(--success) 7%,var(--surface-elevated)); }
+.app-install-offer .notification-consent-icon { background: color-mix(in srgb,var(--success) 14%,transparent); color: var(--success); }
+.install-help-dialog .install-icon { background: var(--accent-soft); color: var(--focus); }
+.install-help-dialog p strong { color: var(--text-primary); }
+@media (display-mode: standalone) { .app-install-offer { display: none; } }
 
 @keyframes mesh-float { to { transform: translate3d(-4%,6%,0) scale(1.08); } }
 @keyframes particle-drift { to { transform: translate3d(18px,-24px,0); opacity: .55; } }
@@ -899,3 +904,4 @@ select { appearance: none; padding-right: 32px !important; background-image: lin
   .room-header, .call-controls { backdrop-filter: none; }
   .entry-form { backdrop-filter: blur(8px); }
 }
+.workspace > p[role="status"] { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; margin: 0; background: color-mix(in srgb, var(--base) 78%, transparent); color: var(--text); font-size: 13px; pointer-events: none; }

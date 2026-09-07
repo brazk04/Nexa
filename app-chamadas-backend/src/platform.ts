@@ -12,12 +12,12 @@ import { Prisma } from '@prisma/client';
 import type { PrismaClient, User, UserPreference } from '@prisma/client';
 import { Server } from 'socket.io';
 import type { Socket } from 'socket.io';
-import type { Ack, CallLeft, CallParticipant, ClientEvents, Message, RoomCall, ServerEvents } from '../../shared/protocol';
+import type { Ack, CallLeft, CallParticipant, ClientEvents, Message, RoomCall, ServerEvents } from '../shared/protocol';
 import { clearSessionCookie, createSession, opaqueToken, publicUser, readCookie, SESSION_COOKIE, sessionUser, tokenHash } from './security';
 import { createVerificationSender } from './email';
 import type { VerificationSender } from './email';
 
-import type { PresenceStatus } from '../../shared/protocol';
+import type { PresenceStatus } from '../shared/protocol';
 
 interface SocketData {
   sala?: string;

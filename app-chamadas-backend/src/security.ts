@@ -45,13 +45,15 @@ export async function createSession(prisma: PrismaClient, user: User, response: 
     userAgent: request?.get('user-agent')?.slice(0, 500), ipAddress: request?.ip?.slice(0, 100),
   } });
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  const sameSite = process.env.COOKIE_SAME_SITE?.toLowerCase() === 'none' && secure ? 'None' : 'Lax';
+  // The Vercel frontend and API are different sites in some mobile browsers.
+  // Cross-site credentialed fetches require SameSite=None; Secure in production.
+  const sameSite = secure && process.env.COOKIE_SAME_SITE?.toLowerCase() !== 'lax' ? 'None' : 'Lax';
   response.setHeader('Set-Cookie', `${SESSION_COOKIE}=${encodeURIComponent(raw)}; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=${Math.floor(SESSION_DURATION_MS / 1000)}${secure}`);
 }
 
 export function clearSessionCookie(response: Response) {
   const secure = process.env.NODE_ENV === 'production' ? '; Secure' : '';
-  const sameSite = process.env.COOKIE_SAME_SITE?.toLowerCase() === 'none' && secure ? 'None' : 'Lax';
+  const sameSite = secure && process.env.COOKIE_SAME_SITE?.toLowerCase() !== 'lax' ? 'None' : 'Lax';
   response.setHeader('Set-Cookie', `${SESSION_COOKIE}=; Path=/; HttpOnly; SameSite=${sameSite}; Max-Age=0${secure}`);
 }
 

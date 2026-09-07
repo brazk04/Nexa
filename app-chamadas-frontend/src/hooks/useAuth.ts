@@ -9,11 +9,10 @@ export function useAuth() {
   const [loading, setLoading] = useState(true);
   const refresh = useCallback(async () => {
     try {
-      const token = new URLSearchParams(window.location.search).get('verify');
-      if (token) {
-        setUser((await api<{ user: AuthUser }>('/auth/verify', { method: 'POST', body: JSON.stringify({ token }) })).user);
-        window.history.replaceState({}, '', window.location.pathname);
-      } else setUser((await api<{ user: AuthUser }>('/auth/me')).user);
+      // Verification links are handled once by AuthScreen. Keeping the
+      // session bootstrap read-only prevents the one-time token from being
+      // consumed twice when the app and the verification screen mount.
+      setUser((await api<{ user: AuthUser }>('/auth/me')).user);
     }
     catch { setUser(null); }
     finally { setLoading(false); }

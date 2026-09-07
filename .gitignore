@@ -18,11 +18,6 @@
 # Uploads e dados locais
 **/storage/
 
-# Builds do aplicativo desktop
-Nexa-*.exe
-**/release/
-**/release-stale/
-
 # Arquivos do sistema/editor
 .DS_Store
 Thumbs.db

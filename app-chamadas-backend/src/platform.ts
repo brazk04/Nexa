@@ -282,7 +282,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
 
   app.get('/auth/me', requireAuth, (request, response) => response.json({ user: publicUser(getAuth(request).user) }));
   app.post('/auth/logout', async (request, response) => {
-    const raw = readCookie(request.headers.cookie, SESSION_COOKIE);
+    const raw = request.headers.authorization?.match(/^Bearer\s+(.+)$/i)?.[1] || readCookie(request.headers.cookie, SESSION_COOKIE);
     if (raw) await prisma.session.deleteMany({ where: { id: tokenHash(raw) } }).catch(() => undefined);
     clearSessionCookie(response);
     response.status(204).end();

@@ -1,0 +1,60 @@
+Continue trabalhando sobre a versão atual da **Coworking Platform** e preserve todas as funcionalidades existentes.
+
+Implemente apenas os ajustes abaixo, mantendo rigorosamente o padrão visual atual do frontend.
+
+1. **Manter foco no campo de mensagem**
+
+   * Atualmente, após enviar uma mensagem, o campo de digitação perde o foco.
+   * Corrija para que, após o envio, o cursor permaneça automaticamente no campo de mensagem.
+   * O usuário deve conseguir continuar digitando imediatamente sem precisar clicar novamente no input/textarea.
+   * Preserve o comportamento de `Enter`, `Shift+Enter` e auto-resize já existente.
+
+2. **Visualização de imagens no chat**
+
+   * Quando o usuário enviar um arquivo de imagem compatível, como PNG, JPG, JPEG, WEBP ou GIF, não exibir apenas como documento/anexo genérico.
+   * Renderizar a imagem diretamente dentro da mensagem no chat.
+   * A imagem deve manter proporção correta, possuir limite de tamanho visual e não ficar cortada.
+   * Ao clicar na imagem, abrir uma visualização ampliada dentro da própria interface, usando modal/lightbox compatível com o design atual.
+   * Manter também uma opção funcional para baixar a imagem original.
+   * Arquivos que não forem imagens continuam sendo exibidos como anexos/documentos normalmente.
+
+3. **Remover mensagens nativas do navegador**
+
+   * Não utilizar `alert()`, `confirm()`, `prompt()` ou mensagens padrão do navegador para ações normais da aplicação.
+   * Substituir todas por componentes internos do sistema.
+   * Para notificações, erros, sucessos e avisos, utilizar o sistema visual de toast/notificação já existente ou criar um compatível com o frontend atual.
+   * Para ações que exigem confirmação, como excluir mensagem, sair de sala ou remover arquivo, utilizar modal de confirmação próprio da Coworking Platform.
+   * Todos esses componentes devem funcionar tanto no tema claro quanto no escuro.
+
+4. **Corrigir a má formatação da foto de perfil nas configurações**
+
+   * Atualmente, na tela **Configurações > Conta e perfil**, a área da foto de perfil está visualmente quebrada/desalinhada.
+   * O avatar aparece espremido ou cortado próximo à divisão entre a sidebar e o conteúdo principal, com sobreposição de elementos e botão de edição fora de posição.
+   * Corrija completamente esse layout.
+   * A foto de perfil deve ficar inteiramente dentro da área de conteúdo da seção **Conta e perfil**, sem invadir a sidebar e sem ser cortada.
+   * Organize corretamente:
+
+     * avatar;
+     * botão/ícone de editar foto;
+     * título “Foto de perfil”;
+     * botão “Escolher imagem”;
+     * eventual botão de remover foto.
+   * O avatar deve manter proporção 1:1, tamanho consistente e `object-fit: cover`.
+   * O botão de edição deve ficar ancorado de forma correta ao avatar, sem causar overflow.
+   * Garanta que o bloco da foto de perfil use layout responsivo com `flex`/`grid` apropriado, sem posicionamentos absolutos frágeis.
+   * Revise `overflow`, `z-index`, `width`, `min-width`, `flex-shrink` e espaçamentos da página de configurações para impedir que o problema volte em resoluções diferentes.
+   * Em telas menores, o layout pode empilhar avatar e controles verticalmente.
+   * Preserve o padrão visual atual, tanto no tema escuro quanto no tema claro.
+
+Antes de concluir:
+
+* procure usos existentes de `alert`, `confirm` e `prompt`;
+* verifique o foco do input após envio;
+* valide preview e download de imagens;
+* valide visualmente a seção de foto de perfil em diferentes larguras;
+* confira se nenhum elemento invade a sidebar de configurações;
+* teste tema claro e escuro;
+* execute build/lint existentes;
+* corrija qualquer erro introduzido.
+
+Não recrie componentes desnecessariamente e não altere regras de negócio fora deste escopo.

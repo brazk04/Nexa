@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="pt-BR">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/png" href="/nexa-logo.png" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101116" />
+    <meta name="description" content="Converse com sua equipe, faça chamadas e compartilhe sua tela no Nexa." />
+    <title>Nexa</title>
+    <script>
+      (() => {
+        try {
+          const saved = localStorage.getItem('cw-theme');
+          const dark = saved === 'dark' || (saved !== 'light' && matchMedia('(prefers-color-scheme: dark)').matches);
+          document.documentElement.dataset.theme = dark ? 'dark' : 'light';
+          document.querySelector('meta[name="theme-color"]').content = dark ? '#101116' : '#f4f5f9';
+        } catch {}
+      })();
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

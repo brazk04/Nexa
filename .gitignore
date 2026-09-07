@@ -1,0 +1,37 @@
+# Dependências e artefatos gerados
+**/node_modules/
+**/dist/
+**/dist-ssr/
+**/test-results/
+**/playwright-report/
+**/.vite/
+
+# Configurações locais e credenciais
+.env
+.env.*
+!.env.example
+
+# Bancos SQLite e arquivos temporários do Prisma
+**/*.db
+**/*.db-*
+
+# Uploads e dados locais
+**/storage/
+
+# Builds do aplicativo desktop
+Nexa-*.exe
+**/release/
+**/release-stale/
+
+# Arquivos do sistema/editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+
+# Configurações locais de agentes e ferramentas
+.agents/
+.claude/
+.cursor/
+.devin/

@@ -1,0 +1,12 @@
+:root {
+  font-family: 'IBM Plex Sans', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--text-primary, #f2f0f6);
+  background: var(--bg-primary, #101116);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+html, body, #root { margin: 0; min-width: 320px; min-height: 100%; }
+body { margin: 0; background: var(--bg-primary, #101116); }
+* { scrollbar-width: thin; scrollbar-color: var(--border-strong, #51485d) transparent; }

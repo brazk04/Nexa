@@ -1,0 +1,72 @@
+{
+  "name": "app-chamadas-frontend",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Aplicativo desktop do Nexa",
+  "author": "Nexa",
+  "main": "desktop/main.cjs",
+  "type": "module",
+  "scripts": {
+    "test": "playwright test",
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "lint": "eslint .",
+    "preview": "vite preview",
+    "desktop:dev": "node desktop/dev.cjs",
+    "desktop:installer": "npm run build && electron-builder --win nsis",
+    "desktop:portable": "npm run build && electron-builder --win portable",
+    "desktop:dist": "npm run build && electron-builder --win"
+  },
+  "dependencies": {
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "socket.io-client": "^4.8.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.63.0",
+    "@types/node": "^24.13.3",
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "@vitejs/plugin-react": "^6.1.0",
+    "electron": "^44.2.0",
+    "electron-builder": "^26.15.3",
+    "eslint": "^10.9.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "eslint-plugin-react-refresh": "^0.5.4",
+    "globals": "^17.11.0",
+    "typescript": "~6.0.2",
+    "typescript-eslint": "^8.67.0",
+    "vite": "^8.2.2"
+  },
+  "build": {
+    "appId": "com.nexa.workspace",
+    "productName": "Nexa",
+    "artifactName": "Nexa-${version}-${arch}.${ext}",
+    "directories": {
+      "output": "release",
+      "buildResources": "desktop/assets"
+    },
+    "files": [
+      "dist/**/*",
+      "desktop/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        { "target": "nsis", "arch": ["x64"] },
+        { "target": "portable", "arch": ["x64"] }
+      ],
+      "icon": "dist/nexa-logo.png"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Nexa"
+    }
+  }
+}

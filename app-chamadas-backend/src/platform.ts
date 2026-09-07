@@ -51,6 +51,7 @@ const messageInclude = {
 type SelectedMessage = Prisma.MensagemGetPayload<{ include: typeof messageInclude }>;
 const formatMessage = (message: SelectedMessage, viewerId?: string): Message => ({
   id: message.id,
+  clientMessageId: message.clientMessageId,
   autor: message.autor,
   displayName: message.user?.displayName || message.autor,
   avatarUrl: message.user ? avatarUrl(message.user) : null,
@@ -503,6 +504,20 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     const messages = await prisma.mensagem.findMany({ where: { roomId, deletedAt: null, OR: [{ texto: { contains: query } }, { autor: { contains: query } }] }, include: messageInclude, orderBy: { criadoEm: 'desc' }, take: 100 });
     response.json({ messages: messages.map(message => formatMessage(message, getAuth(request).user.id)).reverse() });
   });
+  app.get('/rooms/:id/messages', requireAuth, async (request, response) => {
+    const roomId = routeId(request.params.id);
+    if (!await memberFor(request, roomId)) { response.status(403).json({ error: 'Você não tem acesso a esta sala.' }); return; }
+    const before = typeof request.query.before === 'string' ? Number(request.query.before) : 0;
+    const limit = Math.min(100, Math.max(10, Number(request.query.limit) || 50));
+    const messages = await prisma.mensagem.findMany({
+      where: { roomId, ...(Number.isInteger(before) && before > 0 ? { id: { lt: before } } : {}) },
+      include: messageInclude,
+      orderBy: [{ criadoEm: 'desc' }, { id: 'desc' }],
+      take: limit + 1,
+    });
+    const hasMore = messages.length > limit;
+    response.json({ messages: messages.slice(0, limit).reverse().map(message => formatMessage(message, getAuth(request).user.id)), hasMore });
+  });
   app.get('/rooms/:id/qr', requireAuth, async (request, response) => {
     const roomId = routeId(request.params.id);
     const member = await memberFor(request, roomId);
@@ -799,10 +814,12 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       presence(sala);
       socket.emit('chamada_atualizada', snapshot(sala));
       try {
-        const messages = await prisma.mensagem.findMany({ where: { roomId: sala }, include: messageInclude, orderBy: [{ criadoEm: 'asc' }, { id: 'asc' }], take: 500 });
+        const recent = await prisma.mensagem.findMany({ where: { roomId: sala }, include: messageInclude, orderBy: [{ criadoEm: 'desc' }, { id: 'desc' }], take: 51 });
+        const hasMore = recent.length > 50;
+        const messages = recent.slice(0, 50).reverse();
         if (!socket.connected || revision !== socket.data.revision) return;
         socket.data.joining = false;
-        socket.emit('historico_mensagens', { sala, requestId: request.requestId, mensagens: messages.map(message => formatMessage(message, socket.data.userId)) });
+        socket.emit('historico_mensagens', { sala, requestId: request.requestId, mensagens: messages.map(message => formatMessage(message, socket.data.userId)), hasMore });
         await prisma.roomMember.update({ where: { userId_roomId: { userId: socket.data.userId, roomId: sala } }, data: { lastReadAt: new Date() } });
         if (typeof ack === 'function') ack({ ok: true, data: undefined });
       } catch (error) {
@@ -812,25 +829,46 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     });
 
     socket.on('mensagem_chat', async (data: unknown, ack) => {
-      if (!isRecord(data) || !socket.data.sala || socket.data.joining || data.sala !== socket.data.sala || typeof data.texto !== 'string' || !data.texto.trim() || data.texto.length > 4000) {
+      if (!isRecord(data) || !socket.data.sala || socket.data.joining || data.sala !== socket.data.sala || typeof data.texto !== 'string' || !data.texto.trim() || data.texto.length > 4000
+        || (data.clientMessageId !== undefined && (!validId(data.clientMessageId) || data.clientMessageId.length > 100))) {
         reject(socket, ack, 'Envie uma mensagem de até 4.000 caracteres na sala atual.'); return;
       }
       const sala = socket.data.sala;
       const member = await prisma.roomMember.findUnique({ where: { userId_roomId: { userId: socket.data.userId, roomId: sala } } });
       if (!member) { reject(socket, ack, 'Você não tem acesso a esta sala.'); return; }
       try {
+        const clientMessageId = typeof data.clientMessageId === 'string' ? data.clientMessageId : null;
+        if (clientMessageId) {
+          const existing = await prisma.mensagem.findUnique({ where: { clientMessageId }, include: messageInclude });
+          if (existing) {
+            if (existing.roomId !== sala || existing.userId !== socket.data.userId) { reject(socket, ack, 'Identificador de mensagem inválido.'); return; }
+            if (typeof ack === 'function') ack({ ok: true, data: formatMessage(existing, socket.data.userId) });
+            return;
+          }
+        }
         const replyToId = Number.isInteger(data.replyToId) && Number(data.replyToId) > 0 ? Number(data.replyToId) : null;
         if (replyToId && !await prisma.mensagem.findFirst({ where: { id: replyToId, roomId: sala } })) { reject(socket, ack, 'A mensagem respondida não existe nesta sala.'); return; }
         const text = data.texto.trim();
         const mentions = await mentionIds(sala, text);
         const created = await prisma.mensagem.create({ data: {
-          sala, roomId: sala, userId: socket.data.userId, autor: socket.data.username, texto: text, replyToId,
+          sala, roomId: sala, userId: socket.data.userId, autor: socket.data.username, texto: text, replyToId, clientMessageId,
           mentions: mentions.length ? { create: mentions.map(userId => ({ userId })) } : undefined,
         }, include: messageInclude });
         const message = formatMessage(created);
-        io.to(channelKey(sala)).emit('nova_mensagem', message); await notifyMessage(created, socket.data.userId);
+        io.to(channelKey(sala)).emit('nova_mensagem', message);
         if (typeof ack === 'function') ack({ ok: true, data: formatMessage(created, socket.data.userId) });
-      } catch { reject(socket, ack, 'A mensagem não foi salva. Tente enviar novamente.'); }
+        void notifyMessage(created, socket.data.userId).catch(error => console.error('Falha ao notificar mensagem:', error instanceof Error ? error.message : 'erro desconhecido'));
+      } catch (error) {
+        const clientMessageId = typeof data.clientMessageId === 'string' ? data.clientMessageId : null;
+        if (clientMessageId && error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+          const existing = await prisma.mensagem.findUnique({ where: { clientMessageId }, include: messageInclude });
+          if (existing?.roomId === sala && existing.userId === socket.data.userId) {
+            if (typeof ack === 'function') ack({ ok: true, data: formatMessage(existing, socket.data.userId) });
+            return;
+          }
+        }
+        reject(socket, ack, 'A mensagem não foi salva. Tente enviar novamente.');
+      }
     });
 
     socket.on('editar_mensagem', async (data: unknown, ack) => {

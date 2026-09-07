@@ -69,7 +69,6 @@ export function AuthScreen({ login, register, verify, resend }: Props) {
       <span className="mesh mesh-one" /><span className="mesh mesh-two" />
       {Array.from({ length: 10 }, (_, index) => <i key={index} style={{ '--particle': index } as CSSProperties} />)}
     </div>
-    <div className="entry-brand"><NexaLogo compact /></div>
     <section className="entry-content">
       <div className="entry-copy"><NexaLogo className="entry-hero-logo" />
         <span className="entry-eyebrow">Colaboração que mantém o foco</span>

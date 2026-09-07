@@ -14,7 +14,7 @@ export function Sidebar({ sala, rooms, loading, user: account, users, selfId, co
   const channels = rooms.filter(room => !room.favorite);
   const renderRoom = (room: Room) => <RoomRow key={room.id} room={room} active={room.id === sala} onRoom={onRoom} onFavorite={onFavorite} />;
   return <div className="sidebar-content">
-    <div className="workspace-brand"><NexaLogo compact />{onClose && <button className="icon-button" onClick={onClose} aria-label="Fechar menu"><Icon name="close" /></button>}</div>
+    <div className="workspace-brand"><NexaLogo mark />{onClose && <button className="icon-button" onClick={onClose} aria-label="Fechar menu"><Icon name="close" /></button>}</div>
     <div className="sidebar-scroll"><nav aria-label="Salas">
       {favorites.length > 0 && <section className="channel-section"><div className="sidebar-section-title"><h2>Favoritos</h2></div>{favorites.map(renderRoom)}</section>}
       <section className="channel-section"><div className="sidebar-section-title"><h2>Suas salas</h2><button className="icon-button compact-button" onClick={onCreate} aria-label="Criar sala" data-tooltip="Criar sala"><Icon name="plus" size={16} /></button></div>

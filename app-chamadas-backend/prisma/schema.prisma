@@ -86,6 +86,7 @@ model RoomMember {
 
 model Mensagem {
   id        Int       @id @default(autoincrement())
+  clientMessageId String? @unique
   autor     String
   texto     String
   sala      String    @default("geral")

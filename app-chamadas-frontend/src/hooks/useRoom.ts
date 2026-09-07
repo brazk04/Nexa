@@ -1,23 +1,39 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { AppSocket } from '../lib/socket';
-import type { History, Message, Presence, RoomCall, OnlineUser, Result, TypingUser } from '../../../shared/protocol';
+import { api } from '../lib/api';
+import type { AuthUser, History, Message, Presence, RoomCall, OnlineUser, Result, TypingUser } from '../../../shared/protocol';
 
 type Connection = 'connecting' | 'joining' | 'connected' | 'idle' | 'error';
+
 function mergeMessages(first: Message[], second: Message[]) {
-  return [...new Map([...first, ...second].map(message => [message.id, message])).values()].sort((a, b) => a.id - b.id);
+  const merged = [...first];
+  for (const message of second) {
+    const index = merged.findIndex(item => item.id === message.id || Boolean(message.clientMessageId && item.clientMessageId === message.clientMessageId));
+    if (index >= 0) merged[index] = { ...merged[index], ...message };
+    else merged.push(message);
+  }
+  return merged.sort((a, b) => new Date(a.criadoEm).getTime() - new Date(b.criadoEm).getTime() || a.id - b.id);
 }
-export function useRoom(socket: AppSocket, roomId: string | null, onUnauthorized: () => void) {
+
+const confirmed = (message: Message): Message => ({ ...message, deliveryStatus: 'sent' });
+
+export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser, onUnauthorized: () => void) {
   const [status, setStatus] = useState<Connection>(roomId ? 'connecting' : 'idle');
   const [messages, setMessages] = useState<Message[]>([]);
   const [users, setUsers] = useState<OnlineUser[]>([]);
   const [typingUsers, setTypingUsers] = useState<TypingUser[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingEarlier, setLoadingEarlier] = useState(false);
   const [roomCall, setRoomCall] = useState<RoomCall>({ sala: roomId ?? '', callId: null, startedAt: null, participants: [] });
   const [error, setError] = useState('');
   const roomRef = useRef<string | null>(roomId);
   const requestRef = useRef('');
   const mounted = useRef(false);
   const unauthorizedRef = useRef(onUnauthorized);
+  const messagesRef = useRef<Message[]>([]);
+  const pendingId = useRef(-1);
   useEffect(() => { unauthorizedRef.current = onUnauthorized; }, [onUnauthorized]);
+  useEffect(() => { messagesRef.current = messages; }, [messages]);
 
   const join = useCallback(() => {
     const sala = roomRef.current;
@@ -48,15 +64,16 @@ export function useRoom(socket: AppSocket, roomId: string | null, onUnauthorized
     };
     const onHistory = (history: History) => {
       if (history.sala !== roomRef.current || history.requestId !== requestRef.current) return;
-      setMessages(previous => mergeMessages(history.mensagens, previous)); setStatus('connected'); setError('');
+      setMessages(previous => mergeMessages(history.mensagens.map(confirmed), previous));
+      setHasMore(history.hasMore); setStatus('connected'); setError('');
     };
     const onMessage = (message: Message) => {
       if (message.sala !== roomRef.current) return;
-      setMessages(previous => mergeMessages(previous, [message]));
+      setMessages(previous => mergeMessages(previous, [confirmed(message)]));
       if (document.visibilityState === 'visible') socket.emit('marcar_sala_lida', { sala: message.sala });
     };
     const onMessageUpdated = (message: Message) => {
-      if (message.sala === roomRef.current) setMessages(previous => previous.map(item => item.id === message.id ? { ...message, mentioned: item.mentioned || message.mentioned } : item));
+      if (message.sala === roomRef.current) setMessages(previous => previous.map(item => item.id === message.id ? { ...confirmed(message), mentioned: item.mentioned || message.mentioned } : item));
     };
     const onPresence = (presence: Presence) => { if (presence.sala === roomRef.current) setUsers(presence.users); };
     const onCall = (call: RoomCall) => { if (call.sala === roomRef.current) setRoomCall(call); };
@@ -86,7 +103,7 @@ export function useRoom(socket: AppSocket, roomId: string | null, onUnauthorized
     if (roomRef.current && socket.connected) socket.emit('digitando', { sala: roomRef.current, typing: false });
     roomRef.current = roomId; requestRef.current = '';
     const timer = window.setTimeout(() => {
-      setMessages([]); setUsers([]); setTypingUsers([]); setError('');
+      setMessages([]); setUsers([]); setTypingUsers([]); setHasMore(false); setLoadingEarlier(false); setError('');
       setRoomCall({ sala: roomId ?? '', callId: null, startedAt: null, participants: [] });
       setStatus(roomId ? (socket.connected ? 'joining' : 'connecting') : 'idle');
       if (roomId && socket.connected) join();
@@ -94,24 +111,61 @@ export function useRoom(socket: AppSocket, roomId: string | null, onUnauthorized
     return () => window.clearTimeout(timer);
   }, [roomId, socket, join]);
 
-  const reconnect = () => { socket.disconnect(); setStatus(roomRef.current ? 'connecting' : 'idle'); setError(''); socket.connect(); };
-  const sendMessage = async (texto: string, replyToId?: number | null) => {
-    if (!roomRef.current || !socket.connected || status !== 'connected') throw new Error('Espere a conexão com a sala para enviar.');
-    const result: Result<Message> = await socket.timeout(10_000).emitWithAck('mensagem_chat', { sala: roomRef.current, texto, replyToId });
+  const reconnect = useCallback(() => { socket.disconnect(); setStatus(roomRef.current ? 'connecting' : 'idle'); setError(''); socket.connect(); }, [socket]);
+  const persistMessage = useCallback(async (sala: string, texto: string, replyToId: number | null, clientMessageId: string) => {
+    const result: Result<Message> = await socket.timeout(10_000).emitWithAck('mensagem_chat', { sala, texto, replyToId, clientMessageId });
     if (!result.ok) throw new Error(result.error);
-  };
-  const editMessage = async (messageId: number, texto: string) => {
+    setMessages(previous => mergeMessages(previous, [confirmed(result.data)]));
+  }, [socket]);
+  const sendMessage = useCallback(async (texto: string, replyToId?: number | null) => {
+    if (!roomRef.current || !socket.connected || status !== 'connected') throw new Error('Espere a conexão com a sala para enviar.');
+    const sala = roomRef.current; const text = texto.trim(); const clientMessageId = crypto.randomUUID(); const createdAt = new Date();
+    const replied = replyToId ? messagesRef.current.find(message => message.id === replyToId) : undefined;
+    const optimistic: Message = {
+      id: pendingId.current--, clientMessageId, autor: user.username, displayName: user.displayName, avatarUrl: user.avatarUrl,
+      texto: text, sala, criadoEm: createdAt.toISOString(), horario: createdAt.toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }),
+      userId: user.id, editedAt: null, deleted: false, mentioned: false, attachments: [], deliveryStatus: 'sending',
+      replyTo: replied ? { id: replied.id, autor: replied.autor, texto: replied.texto, deleted: replied.deleted } : null,
+    };
+    setMessages(previous => mergeMessages(previous, [optimistic]));
+    try { await persistMessage(sala, text, replyToId ?? null, clientMessageId); }
+    catch (failure) {
+      setMessages(previous => previous.map(message => message.clientMessageId === clientMessageId && message.id < 0 ? { ...message, deliveryStatus: 'failed' } : message));
+      throw failure;
+    }
+  }, [persistMessage, socket, status, user]);
+  const retryMessage = useCallback(async (clientMessageId: string) => {
+    const message = messagesRef.current.find(item => item.clientMessageId === clientMessageId && item.deliveryStatus === 'failed');
+    if (!message || !roomRef.current || !socket.connected) throw new Error('Não foi possível reenviar agora.');
+    setMessages(previous => previous.map(item => item.clientMessageId === clientMessageId ? { ...item, deliveryStatus: 'sending' } : item));
+    try { await persistMessage(roomRef.current, message.texto, message.replyTo?.id ?? null, clientMessageId); }
+    catch (failure) {
+      setMessages(previous => previous.map(item => item.clientMessageId === clientMessageId && item.id < 0 ? { ...item, deliveryStatus: 'failed' } : item));
+      throw failure;
+    }
+  }, [persistMessage, socket]);
+  const loadEarlier = useCallback(async () => {
+    const sala = roomRef.current; const first = messagesRef.current.find(message => message.id > 0);
+    if (!sala || !first || loadingEarlier || !hasMore) return;
+    setLoadingEarlier(true);
+    try {
+      const result = await api<{ messages: Message[]; hasMore: boolean }>(`/rooms/${sala}/messages?before=${first.id}&limit=50`);
+      if (sala !== roomRef.current) return;
+      setMessages(previous => mergeMessages(result.messages.map(confirmed), previous)); setHasMore(result.hasMore);
+    } finally { if (sala === roomRef.current) setLoadingEarlier(false); }
+  }, [hasMore, loadingEarlier]);
+  const editMessage = useCallback(async (messageId: number, texto: string) => {
     if (!roomRef.current) throw new Error('Sala indisponível.');
     const result: Result<Message> = await socket.timeout(10_000).emitWithAck('editar_mensagem', { sala: roomRef.current, messageId, texto });
     if (!result.ok) throw new Error(result.error);
-  };
-  const deleteMessage = async (messageId: number) => {
+  }, [socket]);
+  const deleteMessage = useCallback(async (messageId: number) => {
     if (!roomRef.current) throw new Error('Sala indisponível.');
     const result: Result<Message> = await socket.timeout(10_000).emitWithAck('excluir_mensagem', { sala: roomRef.current, messageId });
     if (!result.ok) throw new Error(result.error);
-  };
+  }, [socket]);
   const setTyping = useCallback((isTyping: boolean) => {
     if (roomRef.current && socket.connected && status === 'connected') socket.emit('digitando', { sala: roomRef.current, typing: isTyping });
   }, [socket, status]);
-  return { status, messages, users, typingUsers, roomCall, error, reconnect, sendMessage, editMessage, deleteMessage, setTyping };
+  return { status, messages, users, typingUsers, roomCall, error, hasMore, loadingEarlier, reconnect, sendMessage, retryMessage, loadEarlier, editMessage, deleteMessage, setTyping };
 }

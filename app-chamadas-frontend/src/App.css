@@ -661,3 +661,195 @@ select { appearance: none; padding-right: 32px !important; background-image: lin
 @media (prefers-reduced-motion: reduce) {
   .entry-atmosphere { display: none; }
 }
+
+/* Responsive and delivery refinements. */
+.nexa-mark {
+  display: block;
+  width: 42px;
+  height: 42px;
+  flex: 0 0 42px;
+  background: url('/nexa-logo.png') center 24% / 250% auto no-repeat;
+}
+.nexa-mark-compact { width: 36px; height: 36px; flex-basis: 36px; }
+.workspace-brand { min-height: 66px; padding-block: 12px; }
+.workspace-brand .nexa-mark { width: 38px; height: 38px; flex-basis: 38px; }
+
+.chat { min-width: 0; overflow: hidden; }
+.message-feed { overscroll-behavior: contain; overflow-x: hidden; }
+.message-body { max-width: 100%; overflow: hidden; }
+.message-meta { min-width: 0; flex-wrap: wrap; row-gap: 2px; }
+.message-meta strong, .message-meta small { max-width: 100%; overflow-wrap: anywhere; }
+.message-body p { max-width: 100%; overflow-wrap: anywhere; word-break: break-word; }
+.attachment-list { width: min(360px,100%); max-width: 100%; }
+.message-attachment, .message-attachment.is-image, .image-attachment-button, .message-attachment.is-image.image-attachment-button {
+  width: min(360px,100%);
+  min-width: 0;
+  max-width: 100%;
+}
+.message-attachment.is-image.image-attachment-button {
+  display: grid;
+  grid-template-columns: minmax(72px,96px) minmax(0,1fr);
+  gap: 8px;
+  align-items: center;
+  overflow: hidden;
+}
+.image-attachment-button img {
+  display: block;
+  grid-column: 1;
+  grid-row: 1;
+  width: 100%;
+  max-width: 96px;
+  aspect-ratio: 4 / 3;
+  height: auto;
+  max-height: 72px;
+}
+.image-attachment-button > span,
+.message-attachment.is-image.image-attachment-button > span:last-child {
+  display: grid;
+  grid-column: 2;
+  grid-row: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0 6px 0 0;
+}
+.image-attachment-button strong, .image-attachment-button small {
+  display: block;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-loader {
+  display: block;
+  min-height: 36px;
+  margin: 12px auto 4px;
+  padding: 7px 12px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+.delivery-sending { opacity: .72; }
+.delivery-failed { border-left-color: var(--danger); }
+.delivery-state { display: block; margin-top: 3px; color: var(--text-tertiary); font-size: 10px; }
+.delivery-state.is-failed { color: var(--danger); }
+.delivery-state button { border: 0; padding: 2px 4px; background: transparent; color: inherit; font-weight: 600; text-decoration: underline; }
+.composer-wrap { flex: 0 0 auto; min-width: 0; background: var(--bg-primary); }
+.composer-context { min-width: 0; }
+.composer-footer > span { min-width: 0; overflow-wrap: anywhere; }
+
+.call-panel.is-maximized { height: 100dvh; }
+.call-panel.is-maximized .call-layout { flex: 1; overflow: hidden; }
+.call-panel.is-maximized .video-grid { height: 100%; overflow: auto; }
+.call-controls { max-width: 100%; flex-wrap: wrap; }
+.participants-panel { min-width: 0; }
+.participants-panel header { align-items: center; gap: 8px; }
+.participants-panel header strong { min-width: 0; flex: 1; }
+.participants-panel header button {
+  display: grid;
+  width: 36px;
+  height: 36px;
+  flex: 0 0 36px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+}
+.participants-panel header button:hover { background: #292c36; }
+.participants-panel > button > span { min-width: 0; flex: 1; overflow-wrap: anywhere; }
+.participants-panel > button small { flex-wrap: wrap; }
+
+@media (max-width: 760px) {
+  [data-tooltip]::after { display: none; }
+  .workspace, .main-panel { width: 100%; max-width: 100vw; }
+  .room-header { min-width: 0; }
+  .room-heading { overflow: hidden; }
+  .room-heading > div { min-width: 0; flex: 1; }
+  .room-heading h1 { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .room-header .header-tool, .room-header .room-tools-button { display: none; }
+  .mobile-menu, .header-tool, .header-call, .icon-button { min-width: 44px; min-height: 44px; }
+  .chat-toolbar { gap: 10px; }
+  .search-field { min-width: 0; flex: 0 1 190px; }
+  .search-field input { width: 100%; }
+  .message { min-width: 0; padding-inline: 12px; }
+  .message-avatar { width: 32px; flex-basis: 32px; }
+  .message-actions { flex: 0 0 auto; }
+  .message-actions button { width: 36px; height: 36px; }
+  .message-attachment.is-image.image-attachment-button { grid-template-columns: minmax(64px,78px) minmax(0,1fr); }
+  .image-attachment-button img { max-width: 78px; }
+  .composer-wrap { padding: 7px 8px max(8px,env(safe-area-inset-bottom)); }
+  .composer { gap: 6px; padding: 7px 7px 7px 9px; }
+  .attach-button, .send-button { width: 42px; min-width: 42px; min-height: 42px; }
+  .composer-footer { padding-inline: 4px; }
+  .composer-footer > span:last-child { display: none; }
+  .new-messages-button { bottom: calc(86px + env(safe-area-inset-bottom)); }
+  .call-panel { max-height: min(54dvh,520px); padding-inline: 8px; }
+  .call-panel-title { min-width: 0; flex-wrap: wrap; gap: 6px; }
+  .call-panel-title .quality { display: none; }
+  .meeting-timer { margin-left: auto; }
+  .video-grid[data-count="1"] { grid-template-columns: minmax(0,1fr); }
+  .video-grid[data-count="2"] { grid-template-columns: repeat(2,minmax(0,1fr)); }
+  .video-grid { gap: 7px; }
+  .video-tile, .waiting-tile { min-height: 130px; }
+  .call-controls { position: sticky; z-index: 7; bottom: 0; flex-wrap: nowrap; justify-content: flex-start; overflow-x: auto; padding: 10px 2px max(4px,env(safe-area-inset-bottom)); background: #0c0d12e8; backdrop-filter: blur(8px); scrollbar-width: none; }
+  .call-controls::-webkit-scrollbar { display: none; }
+  .call-controls button { min-width: 44px; min-height: 44px; padding: 9px 11px; }
+  .call-panel.is-maximized { padding: max(8px,env(safe-area-inset-top)) 8px max(8px,env(safe-area-inset-bottom)); }
+  .call-panel.is-maximized .call-layout { overflow: hidden; }
+  .call-panel.is-maximized .video-grid { align-content: stretch; }
+  .participants-panel { width: min(100%,320px); max-width: 100%; box-shadow: -12px 0 35px #0008; }
+  .participants-panel > button { min-height: 52px; }
+  .shortcut-hint { display: none; }
+  .modal-backdrop { place-items: stretch; padding: 0; }
+  .settings-dialog, .room-tools { width: 100vw; height: 100dvh; max-height: 100dvh; border: 0; border-radius: 0; }
+  .settings-dialog { grid-template-rows: auto minmax(0,1fr); }
+  .settings-nav { min-width: 0; }
+  .settings-content { min-height: 0; padding: 18px 14px max(24px,env(safe-area-inset-bottom)); }
+  .settings-content > header { position: sticky; z-index: 2; top: 0; margin: -18px -14px 0; padding: 14px; background: var(--surface); }
+  .room-tools > header { gap: 8px; padding-inline: 10px; }
+  .room-tools nav { min-width: 0; flex: 1; overflow-x: auto; }
+  .room-tools nav button { min-height: 42px; }
+  .tools-content { min-height: 0; padding: 20px 14px max(24px,env(safe-area-inset-bottom)); }
+  .meeting-row { align-items: flex-start; flex-wrap: wrap; }
+  .meeting-row > span { min-width: min(180px,100%); }
+  .invite-link { flex-direction: column; gap: 8px; }
+  .invite-link button { justify-content: center; min-height: 44px; }
+  .toast { right: 10px; bottom: max(10px,env(safe-area-inset-bottom)); left: 10px; min-width: 0; max-width: none; }
+  .inline-modal-backdrop, .image-lightbox { padding: 8px; }
+  .confirm-actions { flex-wrap: wrap; }
+  .confirm-actions > button { flex: 1; min-width: 120px; }
+  .image-lightbox-dialog { max-height: calc(100dvh - 16px); }
+  .image-lightbox-dialog > footer { padding-bottom: max(13px,env(safe-area-inset-bottom)); }
+  .entry-page { min-width: 0; padding: 18px 16px max(18px,env(safe-area-inset-bottom)); }
+  .entry-content { width: 100%; min-width: 0; margin-block: 20px; }
+  .entry-form { min-width: 0; padding: 22px 18px; }
+  .entry-hero-logo { width: 104px; height: 70px; }
+  .entry-copy h1 { font-size: clamp(27px,9vw,34px); }
+}
+
+@media (max-width: 430px) {
+  .header-call span { display: none; }
+  .header-call { width: 44px; padding: 0; }
+  .chat-toolbar > span { display: none; }
+  .search-field { flex: 1; }
+  .entry-copy br { display: none; }
+  .entry-capabilities { gap: 6px; }
+  .entry-capabilities span { padding: 6px 8px; }
+}
+
+@media (max-width: 360px) {
+  .room-heading h1 { max-width: 120px; }
+  .message-avatar { display: none; }
+  .message { gap: 6px; }
+  .composer textarea { font-size: 16px; }
+  .settings-content header p { display: none; }
+}
+
+@media (max-width: 760px), (pointer: coarse) {
+  .room-header, .call-controls { backdrop-filter: none; }
+  .entry-form { backdrop-filter: blur(8px); }
+}

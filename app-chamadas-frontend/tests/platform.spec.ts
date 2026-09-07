@@ -96,6 +96,7 @@ test('cadastro verificado, salas por código, chat persistente, isolamento e log
     await alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true }).fill(message);
     await alice.page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
     await expect(alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true })).toBeFocused();
+    await expect(alice.page.getByRole('log').getByText(message, { exact: true })).toHaveCount(1);
     await expect(bruno.page.getByRole('log').getByText(message, { exact: true })).toBeVisible();
     await alice.page.getByRole('button', { name: 'Configurações', exact: true }).click();
     await alice.page.getByRole('button', { name: 'Aparência', exact: true }).click();
@@ -122,6 +123,8 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await alice.page.getByRole('button', { name: 'Levantar a mão', exact: true }).click();
     await bruno.page.getByRole('button', { name: 'Abrir participantes', exact: true }).click();
     await expect(bruno.page.locator('.participants-panel').getByText('Mão levantada', { exact: true })).toBeVisible();
+    const closeParticipants = bruno.page.getByRole('button', { name: 'Fechar participantes', exact: true });
+    expect((await closeParticipants.boundingBox())?.width).toBeLessThanOrEqual(44);
     await bruno.page.locator('.participants-panel').getByRole('button', { name: /AliceCall/ }).click();
     await expect(bruno.page.locator('.video-tile.is-pinned').getByText('AliceCall', { exact: false })).toBeVisible();
     await alice.page.getByRole('button', { name: 'Reagir com 🎉', exact: true }).click();
@@ -140,8 +143,13 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
       return state.__peers.filter(peer => peer.connectionState === 'connected').every(peer => peer.getSenders().find(sender => sender.track?.kind === 'video')?.track === screen);
     })).toBe(true);
     await alice.page.getByRole('button', { name: 'Parar compartilhamento', exact: true }).click();
+    await alice.page.setViewportSize({ width: 390, height: 844 });
     await alice.page.getByRole('button', { name: 'Maximizar chamada', exact: true }).click();
     await expect(alice.page.getByRole('button', { name: 'Restaurar chamada', exact: true })).toBeVisible();
+    const leaveButton = alice.page.getByRole('button', { name: 'Encerrar chamada', exact: true });
+    await leaveButton.scrollIntoViewIfNeeded();
+    await expect(leaveButton).toBeVisible();
+    expect(await alice.page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
     await alice.page.getByRole('button', { name: 'Restaurar chamada', exact: true }).click();
     await bruno.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
     await expect(alice.page.getByText('BrunoCall saiu da chamada.', { exact: true })).toBeVisible();
@@ -169,4 +177,43 @@ test('cancelar enquanto a permissão está pendente não deixa tracks ou peers �
   await page.evaluate(() => (window as unknown as InstrumentedWindow).__releaseMedia?.());
   await expectStopped(page);
   await expect.poll(() => page.evaluate(() => (window as unknown as InstrumentedWindow).__peers.length)).toBe(0);
+});
+
+test('layout móvel mantém login, marca, chat e anexos dentro da viewport', async ({ browser }) => {
+  const context = await browser.newContext({ viewport: { width: 390, height: 844 } });
+  const page = await context.newPage();
+  try {
+    for (const width of [320, 375, 390, 430]) {
+      await page.setViewportSize({ width, height: 844 });
+      await page.goto('/');
+      await expect(page.locator('.entry-copy .nexa-logo')).toHaveCount(1);
+      await expect(page.locator('.entry-page .entry-brand .nexa-logo')).toHaveCount(0);
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+    }
+
+    await page.setViewportSize({ width: 320, height: 720 });
+    await signup(page, `Mobile${Date.now()}`);
+    await createRoom(page, 'Sala Mobile');
+    await page.getByRole('button', { name: 'Abrir menu' }).click();
+    const mark = page.locator('.mobile-drawer .nexa-mark');
+    await expect(mark).toBeVisible();
+    expect((await mark.boundingBox())?.width).toBeLessThanOrEqual(44);
+    await page.getByRole('button', { name: 'Fechar menu' }).click();
+
+    await page.locator('.attach-button input[type="file"]').setInputFiles({
+      name: 'imagem-com-nome-bem-longo-para-validar-layout.png',
+      mimeType: 'image/png',
+      buffer: Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Z4x8AAAAASUVORK5CYII=', 'base64'),
+    });
+    await page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
+    const attachment = page.getByRole('button', { name: /Visualizar imagem imagem-com-nome/ });
+    await expect(attachment).toBeVisible();
+    const imageBox = await attachment.locator('img').boundingBox();
+    const textBox = await attachment.locator('span').boundingBox();
+    expect(imageBox && textBox && textBox.x >= imageBox.x + imageBox.width).toBe(true);
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+
+    const composer = await page.locator('.composer').boundingBox();
+    expect(composer && composer.x >= 0 && composer.x + composer.width <= 320).toBe(true);
+  } finally { await context.close(); }
 });

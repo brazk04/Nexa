@@ -27,11 +27,12 @@ export interface Message {
   id: number; autor: string; displayName: string; avatarUrl: string | null; texto: string; sala: string;
   criadoEm: string; horario: string; userId?: string | null; editedAt: string | null; deleted: boolean;
   mentioned: boolean; replyTo: MessageReply | null; attachments: AttachmentInfo[];
+  clientMessageId: string | null; deliveryStatus?: 'sending' | 'sent' | 'failed';
 }
 export interface RoomRequest { sala: string; requestId: string }
 export interface CallRequest { sala: string; attemptId: string }
 export interface RoomCall { sala: string; callId: string | null; startedAt: string | null; participants: CallParticipant[] }
-export interface History { sala: string; requestId: string; mensagens: Message[] }
+export interface History { sala: string; requestId: string; mensagens: Message[]; hasMore: boolean }
 export interface Presence { sala: string; users: OnlineUser[] }
 export interface CallReaction { id: string; sala: string; callId: string; userId: string; username: string; displayName: string; emoji: string; createdAt: string }
 export interface RoomNotification { roomId: string; messageId: number; mention: boolean; author: string; preview: string }
@@ -46,7 +47,7 @@ export interface SignalSource { sala: string; callId: string; from: string }
 export interface CallLeft { sala: string; callId: string; socketId: string; username: string; reason: 'left' | 'room-change' | 'disconnected' }
 export interface ClientEvents {
   entrar_sala: (request: RoomRequest, ack: Ack) => void;
-  mensagem_chat: (message: { sala: string; texto: string; replyToId?: number | null }, ack: Ack<Message>) => void;
+  mensagem_chat: (message: { sala: string; texto: string; replyToId?: number | null; clientMessageId?: string }, ack: Ack<Message>) => void;
   editar_mensagem: (request: { sala: string; messageId: number; texto: string }, ack: Ack<Message>) => void;
   excluir_mensagem: (request: { sala: string; messageId: number }, ack: Ack<Message>) => void;
   marcar_sala_lida: (request: { sala: string }) => void;

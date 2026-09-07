@@ -128,13 +128,34 @@ test('chat e presença usam identidade autenticada e preservam histórico', asyn
   const b = await client(bob.cookie, room.id);
   assert.deepEqual((await presence).users.map(user => user.username).sort(), ['Alice', 'Bruno']);
   const received = event<Message>(b, 'nova_mensagem');
-  const result = await a.timeout(4000).emitWithAck('mensagem_chat', { sala: room.id, texto: '  Olá equipe  ', autor: 'Forjado' } as { sala: string; texto: string });
+  const clientMessageId = randomUUID();
+  const result = await a.timeout(4000).emitWithAck('mensagem_chat', { sala: room.id, texto: '  Olá equipe  ', clientMessageId, autor: 'Forjado' } as { sala: string; texto: string; clientMessageId: string });
   assert.equal(result.ok, true); const message = await received;
   assert.equal(message.autor, 'Alice'); assert.equal(message.texto, 'Olá equipe'); assert.ok(message.userId);
+  const repeated: Result<Message> = await a.timeout(4000).emitWithAck('mensagem_chat', { sala: room.id, texto: 'Olá equipe', clientMessageId });
+  assert.equal(repeated.ok, true); if (!repeated.ok) throw new Error(repeated.error);
+  assert.equal(repeated.data.id, message.id);
+  assert.equal(await prisma.mensagem.count({ where: { clientMessageId } }), 1);
   b.disconnect(); const reconnected = await client(bob.cookie, room.id);
   const requestId = randomUUID(); const history = event<History>(reconnected, 'historico_mensagens', data => data.requestId === requestId);
   reconnected.emit('entrar_sala', { sala: room.id, requestId }, () => undefined);
   assert.equal((await history).mensagens[0]?.id, message.id);
+});
+
+test('histórico entrega 50 mensagens e pagina as anteriores sem duplicar', async () => {
+  const alice = await account('AliceHistory'); const room = await createRoom(alice.cookie);
+  const owner = await prisma.user.findUniqueOrThrow({ where: { usernameNormalized: 'alicehistory' } });
+  await prisma.mensagem.createMany({ data: Array.from({ length: 55 }, (_, index) => ({
+    sala: room.id, roomId: room.id, userId: owner.id, autor: owner.username, texto: `Mensagem ${String(index + 1).padStart(2, '0')}`,
+  })) });
+  const latestResponse = await request(`/rooms/${room.id}/messages?limit=50`, undefined, alice.cookie);
+  assert.equal(latestResponse.status, 200);
+  const latest = await latestResponse.json() as { messages: Message[]; hasMore: boolean };
+  assert.equal(latest.messages.length, 50); assert.equal(latest.hasMore, true);
+  const earlierResponse = await request(`/rooms/${room.id}/messages?before=${latest.messages[0]!.id}&limit=50`, undefined, alice.cookie);
+  const earlier = await earlierResponse.json() as { messages: Message[]; hasMore: boolean };
+  assert.equal(earlier.messages.length, 5); assert.equal(earlier.hasMore, false);
+  assert.equal(new Set([...earlier.messages, ...latest.messages].map(message => message.id)).size, 55);
 });
 
 test('chamada mesh aceita 15, recusa o 16º, roteia sinais e remove somente quem sai', async () => {

@@ -34,6 +34,9 @@ O envio é desacoplado e usa SMTP por meio do Nodemailer. Configure no backend:
 - `FRONTEND_URL`, usado no link de verificação;
 - `CORS_ORIGIN`, com as origens permitidas separadas por vírgula;
 - `DATABASE_URL`, opcional para sobrescrever o SQLite;
+- `REDIS_URL` (ou `KV_URL`) para sincronizar Socket.IO entre instâncias de produção;
+- `BLOB_READ_WRITE_TOKEN` (ou OIDC + `BLOB_STORE_ID`) para anexos persistentes no Vercel Blob privado;
+- `CLOUDFLARE_TURN_KEY_ID` e `CLOUDFLARE_TURN_API_TOKEN`, opcionais, para credenciais TURN temporárias;
 - `NODE_ENV=production`, que habilita `Secure` no cookie;
 - `PORT`, padrão `3333`.
 
@@ -69,7 +72,7 @@ Uploads usam armazenamento local organizado em `storage/avatars` e `storage/file
 
 ## Chamadas
 
-Cada participante mantém um `RTCPeerConnection` por pessoa remota. Ofertas, respostas e ICE são roteados por socket de destino e cada peer possui sua própria fila de candidates. A entrada do 16º participante é recusada no backend.
+Cada participante mantém um `RTCPeerConnection` por pessoa remota. Ofertas, respostas e ICE são roteados por socket de destino e cada peer possui sua própria fila de candidates. A entrada do 16º participante é recusada no backend e coordenada entre instâncias com lock distribuído quando Redis está configurado.
 
 Microfone e câmera continuam usando `MediaStreamTrack.enabled`. O compartilhamento substitui o track de vídeo em todos os senders ativos; peers criados durante o compartilhamento já recebem o track da tela. Sair remove apenas o peer correspondente; logout, troca de sala, queda do socket e desmontagem fecham conexões e tracks. O botão Maximizar abre um layout dedicado na viewport sem interromper a chamada.
 
@@ -79,7 +82,7 @@ Eventos Socket.io adicionais: `atualizar_mao`, `enviar_reacao`, `atualizar_midia
 
 Os endpoints REST adicionais ficam sob `/preferences`, `/account`, `/rooms/:id`, `/rooms/:id/messages/search`, `/rooms/:id/attachments`, `/rooms/:id/qr`, `/rooms/:id/calls` e `/rooms/:id/meeting`, com subrotas para agenda, decisões e ações. Todas as rotas de dados validam sessão e associação à sala.
 
-Esta V1 usa STUN público e não possui TURN ou SFU. Mesh com 15 pessoas pode exigir upload, CPU e memória elevados, especialmente com vídeo. Para produção em escala, um SFU e infraestrutura TURN serão necessários.
+Sem credenciais adicionais a V1 usa STUN público. Quando Cloudflare TURN está configurado, o backend fornece credenciais efêmeras como fallback de conectividade. Mesh com 15 pessoas ainda pode exigir upload, CPU e memória elevados, especialmente com vídeo; para escala maior, use SFU.
 
 ## Verificação
 

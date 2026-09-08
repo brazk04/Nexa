@@ -46,10 +46,12 @@ export function SettingsDialog({ user, preferences, onSavePreferences, onUser, o
   const [devices, setDevices] = useState<MediaDeviceInfo[]>([]);
   const [preview, setPreview] = useState<MediaStream | null>(null);
   const video = useRef<HTMLVideoElement>(null);
+  const previewGeneration = useRef(0);
   const [sessions, setSessions] = useState<SessionInfo[]>([]);
   const microphoneLevel = useMicrophoneLevel(preview);
   useEffect(() => { if (video.current) video.current.srcObject = preview; }, [preview]);
   useEffect(() => () => preview?.getTracks().forEach(track => track.stop()), [preview]);
+  useEffect(() => () => { ++previewGeneration.current; }, []);
   useEffect(() => { if (tab === 'security') void api<{ sessions: SessionInfo[] }>('/account/sessions').then(result => setSessions(result.sessions)); }, [tab]);
   useEffect(() => {
     if (tab !== 'devices' || !navigator.mediaDevices?.enumerateDevices) return;
@@ -65,12 +67,14 @@ export function SettingsDialog({ user, preferences, onSavePreferences, onUser, o
   };
   const savePreferences = () => run(async () => { const saved = await onSavePreferences(draft); setDraft(saved); }, 'Preferências salvas.');
   const startPreview = async () => {
+    const generation = ++previewGeneration.current;
     preview?.getTracks().forEach(track => track.stop());
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         video: draft.cameraId ? { deviceId: { exact: draft.cameraId } } : true,
         audio: draft.microphoneId ? { deviceId: { exact: draft.microphoneId } } : true,
       });
+      if (generation !== previewGeneration.current) { stream.getTracks().forEach(track => track.stop()); return; }
       setPreview(stream); setDevices(await navigator.mediaDevices.enumerateDevices()); setMessage('Prévia ativa. Fale para testar o microfone.');
     } catch { setMessage('Não foi possível acessar câmera e microfone. Confira a permissão do navegador.'); }
   };

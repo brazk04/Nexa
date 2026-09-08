@@ -1,5 +1,11 @@
 {
+  "$schema": "https://openapi.vercel.sh/vercel.json",
   "version": 2,
+  "fluid": true,
+  "regions": ["gru1"],
+  "functions": {
+    "api/index.ts": { "maxDuration": 300 }
+  },
   "outputDirectory": "dist",
   "routes": [
     { "src": "/(.*)", "dest": "/api/index.ts" }

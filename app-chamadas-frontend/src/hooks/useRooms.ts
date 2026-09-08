@@ -35,7 +35,7 @@ export function useRooms() {
   const notifyRoom = useCallback(async (roomId: string, enabled: boolean) => {
     await api(`/rooms/${roomId}/notifications`, { method: 'PUT', body: JSON.stringify({ enabled }) }); patchRoom(roomId, { notificationsEnabled: enabled });
   }, [patchRoom]);
-  const markRead = useCallback((roomId: string) => { patchRoom(roomId, { unreadCount: 0, mentionCount: 0 }); void api(`/rooms/${roomId}/read`, { method: 'POST' }); }, [patchRoom]);
+  const markRead = useCallback((roomId: string) => { patchRoom(roomId, { unreadCount: 0, mentionCount: 0 }); void api(`/rooms/${roomId}/read`, { method: 'POST' }).catch(() => setError('Não foi possível atualizar a leitura da sala.')); }, [patchRoom]);
   const notify = useCallback((roomId: string, mention: boolean) => setRooms(current => current.map(room => room.id === roomId
     ? { ...room, unreadCount: room.unreadCount + 1, mentionCount: room.mentionCount + (mention ? 1 : 0) } : room)), []);
   const removeRoom = useCallback((roomId: string) => {

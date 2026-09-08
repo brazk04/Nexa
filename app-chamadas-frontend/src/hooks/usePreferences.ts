@@ -20,9 +20,10 @@ export function usePreferences() {
   const [loading, setLoading] = useState(true);
   const load = useCallback(async () => {
     try { setPreferences((await api<{ preferences: UserPreferences }>('/preferences')).preferences); }
+    catch { console.warn('Não foi possível carregar preferências; usando os padrões locais.'); }
     finally { setLoading(false); }
   }, []);
-  useEffect(() => { void load(); }, [load]);
+  useEffect(() => { const timer = window.setTimeout(() => void load(), 0); return () => window.clearTimeout(timer); }, [load]);
   useEffect(() => {
     const systemTheme = matchMedia('(prefers-color-scheme: dark)');
     const applyTheme = () => {

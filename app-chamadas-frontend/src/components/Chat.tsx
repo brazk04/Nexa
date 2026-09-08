@@ -1,7 +1,7 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { AttachmentInfo, Message, Room, TypingUser } from '../../../shared/protocol';
-import { api, API_URL } from '../lib/api';
+import { api, authorizedFetch } from '../lib/api';
 import { Avatar } from './Avatar';
 import { Icon } from './Icon';
 
@@ -224,19 +224,32 @@ export function Chat({ room, messages, ready, userId, typingUsers, hasMore, load
 function Attachment({ attachment, onPreview }: { attachment: AttachmentInfo; onPreview: (attachment: AttachmentInfo) => void }) {
   const isImage = attachment.mimeType.startsWith('image/');
   const icon = isImage ? 'image' : attachment.mimeType.includes('zip') || attachment.mimeType.includes('compressed') ? 'archive' : 'file';
-  const href = `${API_URL}${attachment.downloadUrl}`;
   if (isImage) return <button type="button" className="message-attachment is-image image-attachment-button" onClick={() => onPreview(attachment)} aria-label={'Visualizar imagem ' + attachment.name}>
-    <img src={href} alt="" loading="lazy" decoding="async" /><span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)} · Abrir imagem</small></span>
+    <AuthenticatedImage path={attachment.downloadUrl} /><span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)} · Abrir imagem</small></span>
   </button>;
-  return <a className={`message-attachment ${isImage ? 'is-image' : ''}`} href={href} target="_blank" rel="noreferrer">
-    {isImage && <img src={href} alt="" loading="lazy" />}
+  return <button type="button" className="message-attachment" onClick={() => void downloadAttachment(attachment)}>
     <span className="attachment-icon"><Icon name={icon} size={19} /></span>
     <span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)}</small></span>
-  </a>;
+  </button>;
+}
+
+function AuthenticatedImage({ path }: { path: string }) {
+  const image = useRef<HTMLImageElement>(null);
+  const [visible, setVisible] = useState(() => !('IntersectionObserver' in window));
+  const href = useAttachmentUrl(path, visible);
+  useEffect(() => {
+    const target = image.current;
+    if (!target || visible) return;
+    const observer = new IntersectionObserver(entries => {
+      if (entries.some(entry => entry.isIntersecting)) { setVisible(true); observer.disconnect(); }
+    }, { rootMargin: '300px' });
+    observer.observe(target); return () => observer.disconnect();
+  }, [visible]);
+  return <img ref={image} src={href || undefined} alt="" decoding="async" />;
 }
 
 function ImageLightbox({ attachment, onClose }: { attachment: AttachmentInfo; onClose: () => void }) {
-  const href = API_URL + attachment.downloadUrl;
+  const href = useAttachmentUrl(attachment.downloadUrl, true);
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', close);
@@ -245,10 +258,37 @@ function ImageLightbox({ attachment, onClose }: { attachment: AttachmentInfo; on
   return <div className="image-lightbox" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="image-lightbox-dialog" role="dialog" aria-modal="true" aria-label={'Visualização de ' + attachment.name}>
       <header><strong>{attachment.name}</strong><button type="button" aria-label="Fechar visualização" onClick={onClose}><Icon name="close" size={18} /></button></header>
-      <div className="image-lightbox-stage"><img src={href} alt={attachment.name} decoding="async" /></div>
-      <footer><span>{formatBytes(attachment.size)}</span><a className="primary-button" href={href} download={attachment.name} target="_blank" rel="noreferrer"><Icon name="file" size={16} />Baixar imagem</a></footer>
+      <div className="image-lightbox-stage">{href ? <img src={href} alt={attachment.name} decoding="async" /> : <span role="status">Carregando imagem…</span>}</div>
+      <footer><span>{formatBytes(attachment.size)}</span><button type="button" className="primary-button" onClick={() => void downloadAttachment(attachment)}><Icon name="file" size={16} />Baixar imagem</button></footer>
     </section>
   </div>;
+}
+
+function useAttachmentUrl(path: string, enabled: boolean) {
+  const [url, setUrl] = useState('');
+  useEffect(() => {
+    if (!enabled) return;
+    let active = true; let objectUrl = '';
+    void authorizedFetch(path).then(response => {
+      if (!response.ok) throw new Error('attachment-unavailable');
+      return response.blob();
+    }).then(blob => {
+      if (!active) return;
+      objectUrl = URL.createObjectURL(blob); setUrl(objectUrl);
+    }).catch(() => { if (active) setUrl(''); });
+    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [enabled, path]);
+  return url;
+}
+
+async function downloadAttachment(attachment: AttachmentInfo) {
+  const response = await authorizedFetch(attachment.downloadUrl);
+  if (!response.ok) return;
+  const objectUrl = URL.createObjectURL(await response.blob());
+  const link = document.createElement('a');
+  link.href = objectUrl; link.download = attachment.name; link.rel = 'noreferrer';
+  document.body.appendChild(link); link.click(); link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1_000);
 }
 
 function sameDay(first: string, second: string) { return new Date(first).toDateString() === new Date(second).toDateString(); }

@@ -5,6 +5,7 @@ import type { RegisterInput } from '../hooks/useAuth';
 import { NexaLogo } from './NexaLogo';
 
 interface Props {
+  initialMode?: 'login' | 'register';
   login: (username: string, password: string) => Promise<void>;
   register: (input: RegisterInput) => Promise<{ emailSent: boolean; message: string }>;
   verify: (token: string) => Promise<void>;
@@ -12,9 +13,9 @@ interface Props {
 }
 type Mode = 'login' | 'register' | 'verify';
 
-export function AuthScreen({ login, register, verify, resend }: Props) {
+export function AuthScreen({ login, register, verify, resend, initialMode = 'login' }: Props) {
   const initialToken = new URLSearchParams(window.location.search).get('verify') ?? '';
-  const [mode, setMode] = useState<Mode>(initialToken ? 'verify' : 'login');
+  const [mode, setMode] = useState<Mode>(initialToken ? 'verify' : initialMode);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
   const [email, setEmail] = useState('');

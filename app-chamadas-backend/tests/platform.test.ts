@@ -84,6 +84,7 @@ beforeEach(async () => {
 afterEach(async () => {
   sockets.forEach(socket => socket.disconnect()); sockets = [];
   await new Promise<void>(resolveClose => platform.io.close(() => resolveClose()));
+  await platform.whenIdle();
   await prisma.$disconnect(); await rm(folder, { recursive: true, force: true });
 });
 
@@ -291,5 +292,22 @@ test('uploads validam conteúdo, exigem associação à sala e removem arquivos 
   assert.equal((await request(attachment.downloadUrl, undefined, alice.cookie)).status, 404);
   const invalid = new FormData(); invalid.append('file', new Blob(['MZ executable'], { type: 'application/octet-stream' }), 'programa.exe');
   assert.equal((await fetch(`${url}/rooms/${room.id}/attachments`, { method: 'POST', headers: { cookie: alice.cookie }, body: invalid })).status, 400);
+});
+
+test('fotos de perfil ficam no banco e continuam disponíveis após nova leitura', async () => {
+  const alice = await account('AliceAvatar');
+  const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
+  const form = new FormData(); form.append('avatar', new Blob([png], { type: 'image/png' }), 'perfil.png');
+  const uploaded = await fetch(`${url}/account/avatar`, { method: 'POST', headers: { cookie: alice.cookie }, body: form });
+  assert.equal(uploaded.status, 200);
+  const user = (await uploaded.json() as { user: { id: string; avatarUrl: string | null } }).user;
+  assert.ok(user.avatarUrl);
+  const stored = await prisma.user.findUnique({ where: { username: 'AliceAvatar' }, select: { avatarPath: true } });
+  assert.ok(stored?.avatarPath?.startsWith('data:image/png;base64,'));
+  const image = await request(user.avatarUrl!, undefined, alice.cookie);
+  assert.equal(image.status, 200); assert.equal(image.headers.get('content-type'), 'image/png');
+  assert.deepEqual(Buffer.from(await image.arrayBuffer()), png);
+  const me = await request('/auth/me', undefined, alice.cookie);
+  assert.equal((await me.json() as { user: { avatarUrl: string | null } }).user.avatarUrl, user.avatarUrl);
 });
 interface CallLeftLike { socketId: string }

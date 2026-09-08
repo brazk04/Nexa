@@ -17,17 +17,43 @@ function useSpeaking(stream: MediaStream | null, enabled: boolean) {
   }, [stream, enabled]); return Boolean(stream && enabled && stream.getAudioTracks().length && speaking);
 }
 function VideoTile({ stream, participant, local, pinned, onPin, speakerId }: { stream: MediaStream | null; participant: CallParticipant; local?: boolean; pinned: boolean; onPin: () => void; speakerId?: string }) {
-  const video = useRef<HTMLVideoElement>(null); const [playBlocked, setPlayBlocked] = useState(false); const speaking = useSpeaking(stream, participant.microphone);
-  useEffect(() => { const element = video.current; if (!element) return; element.srcObject = stream; if (stream) void element.play().catch(() => setPlayBlocked(true)); return () => { element.pause(); element.srcObject = null; }; }, [stream]);
-  useEffect(() => { const element = video.current as (HTMLVideoElement & { setSinkId?: (id: string) => Promise<void> }) | null; if (element?.setSinkId && speakerId) void element.setSinkId(speakerId).catch(() => undefined); }, [speakerId]);
+  const video = useRef<HTMLVideoElement>(null); const audio = useRef<HTMLAudioElement>(null); const [playBlocked, setPlayBlocked] = useState(false); const speaking = useSpeaking(stream, participant.microphone);
+  const [videoBlocked, setVideoBlocked] = useState(false);
+  useEffect(() => {
+    const element = audio.current;
+    if (!element || local || !stream) return;
+    let disposed = false;
+    // A muted video receiver can hold a combined element at HAVE_METADATA.
+    // Keep audible playback independent from camera/screen readiness.
+    element.srcObject = new MediaStream(stream.getAudioTracks());
+    const play = () => { void element.play().then(() => { if (!disposed) setPlayBlocked(false); }).catch(error => { if (!disposed && error.name !== 'AbortError') setPlayBlocked(true); }); };
+    stream.getAudioTracks().forEach(track => track.addEventListener('unmute', play));
+    play();
+    return () => { disposed = true; stream.getAudioTracks().forEach(track => track.removeEventListener('unmute', play)); element.pause(); element.srcObject = null; };
+  }, [stream, local]);
+  useEffect(() => {
+    const element = video.current; if (!element) return;
+    let disposed = false;
+    const play = () => { if (stream) void element.play().then(() => { if (!disposed) setVideoBlocked(false); }).catch(error => { if (!disposed && error.name !== 'AbortError') setVideoBlocked(true); }); };
+    element.srcObject = stream;
+    element.addEventListener('loadedmetadata', play);
+    stream?.getTracks().forEach(track => track.addEventListener('unmute', play));
+    play();
+    return () => { disposed = true; element.removeEventListener('loadedmetadata', play); stream?.getTracks().forEach(track => track.removeEventListener('unmute', play)); element.pause(); element.srcObject = null; };
+  }, [stream]);
+  useEffect(() => { const element = audio.current as (HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }) | null; if (element?.setSinkId) void element.setSinkId(speakerId || '').catch(() => setPlayBlocked(true)); }, [speakerId]);
   const hidden = !participant.camera && !participant.screen;
   return <article className={`video-tile ${participant.screen ? 'is-sharing' : ''} ${speaking ? 'is-speaking' : ''} ${pinned ? 'is-pinned' : ''}`} onDoubleClick={onPin}>
-    <video ref={video} autoPlay playsInline muted={local} className={hidden || !stream ? 'video-hidden' : ''} />
+    <video ref={video} autoPlay playsInline muted className={hidden || !stream ? 'video-hidden' : ''} />
+    {!local && <audio ref={audio} autoPlay aria-label={`Áudio de ${participant.displayName}`} />}
     {(hidden || !stream) && <div className="video-placeholder"><Avatar name={participant.displayName} url={participant.avatarUrl} /><span>{stream ? 'Câmera desativada' : 'Aguardando vídeo'}</span></div>}
     {participant.handRaisedAt && <span className="raised-hand" title="Mão levantada"><Icon name="hand" size={18} /></span>}
     <button className="pin-button" onClick={onPin} aria-label={pinned ? 'Desafixar participante' : 'Fixar participante'} data-tooltip={pinned ? 'Desafixar' : 'Fixar'}><Icon name="pin" size={16} /></button>
     <div className="video-caption"><strong>{participant.displayName}{local ? ' (você)' : ''}</strong><span>{participant.screen ? 'Compartilhando tela' : !participant.microphone ? 'Microfone desativado' : speaking ? 'Falando' : ''}</span></div>
-    {playBlocked && stream && <button className="play-button" onClick={() => void video.current?.play().then(() => setPlayBlocked(false))}>Reproduzir áudio e vídeo</button>}
+    {(playBlocked || videoBlocked) && stream && <button className="play-button" onClick={() => {
+      void audio.current?.play().then(() => setPlayBlocked(false)).catch(() => setPlayBlocked(true));
+      void video.current?.play().then(() => setVideoBlocked(false)).catch(() => setVideoBlocked(true));
+    }}>Reproduzir áudio e vídeo</button>}
   </article>;
 }
 export function VideoCall({ state, controller, username, selfId, selfUserId, selfAvatarUrl, ownerId, speakerId }: { state: CallState; controller: CallController; username: string; selfId?: string; selfUserId: string; selfAvatarUrl: string | null; ownerId: string; speakerId?: string }) {

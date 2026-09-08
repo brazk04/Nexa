@@ -82,6 +82,7 @@ model RoomMember {
 
   @@id([userId, roomId])
   @@index([roomId])
+  @@index([userId, favorite, joinedAt])
 }
 
 model Mensagem {
@@ -104,6 +105,7 @@ model Mensagem {
   attachments Attachment[]
 
   @@index([roomId, criadoEm])
+  @@index([roomId, id])
   @@index([userId])
   @@index([replyToId])
 }
@@ -142,6 +144,7 @@ model Session {
   user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+  @@index([userId, lastSeenAt])
   @@index([expiresAt])
 }
 
@@ -169,6 +172,7 @@ model CallHistory {
   participants CallAttendance[]
 
   @@index([roomId, startedAt])
+  @@index([roomId, endedAt])
 }
 
 model CallAttendance {

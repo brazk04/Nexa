@@ -9,6 +9,11 @@ export function createSocket(): AppSocket {
   return io(url, {
     autoConnect: false,
     withCredentials: true,
+    timeout: 20_000,
+    reconnection: true,
+    reconnectionDelay: 750,
+    reconnectionDelayMax: 8_000,
+    randomizationFactor: 0.5,
     auth: { token: localStorage.getItem('nexa-session-token') || undefined },
     ...(websocketOnly ? { transports: ['websocket'] as const } : {}),
   });

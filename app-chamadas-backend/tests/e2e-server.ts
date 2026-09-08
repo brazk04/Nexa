@@ -12,13 +12,17 @@ async function main() {
   await prisma.emailVerificationToken.deleteMany(); await prisma.session.deleteMany();
   await prisma.mensagem.deleteMany({ where: { roomId: { not: null } } }); await prisma.roomMember.deleteMany(); await prisma.room.deleteMany(); await prisma.user.deleteMany();
   const tokens = new Map<string, string>();
-  const { server, io, app } = createPlatform(prisma, { storageRoot: join(directory, 'storage'), sendVerificationEmail: async message => {
+  const { server, io, app, whenIdle } = createPlatform(prisma, { storageRoot: join(directory, 'storage'), sendVerificationEmail: async message => {
     tokens.set(message.username, message.token); return true;
   } });
   app.get('/__test/verification/:username', (request, response) => {
     const token = tokens.get(request.params.username);
     if (!token) { response.status(404).json({ error: 'not-found' }); return; }
     response.json({ token });
+  });
+  app.post('/__test/disconnect/:username', (request, response) => {
+    for (const socket of io.sockets.sockets.values()) if (socket.data.username === request.params.username) socket.conn.close();
+    response.status(204).end();
   });
   server.listen(3355, '127.0.0.1', () => console.log('Isolated browser test server: 3355'));
   let closing = false;
@@ -30,7 +34,7 @@ async function main() {
     io.close();
     server.closeAllConnections();
     server.close();
-    void prisma.$disconnect().then(() => rm(directory, { recursive: true, force: true })).finally(() => {
+    void whenIdle().then(() => prisma.$disconnect()).then(() => rm(directory, { recursive: true, force: true })).finally(() => {
       clearTimeout(fallback); process.exit(0);
     });
   };

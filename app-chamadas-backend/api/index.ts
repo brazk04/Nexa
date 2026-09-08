@@ -1,14 +1,13 @@
 import 'dotenv/config';
-import { PrismaClient } from '@prisma/client';
 import { createPlatform } from '../src/platform';
+import { prisma } from '../src/db';
+import { createRealtimeInfrastructure } from '../src/realtime';
 
-const prisma = new PrismaClient(process.env.DATABASE_URL
-  ? { datasources: { db: { url: process.env.DATABASE_URL } } } : undefined);
-
-// Vercel's filesystem is temporary. Persistent avatars and attachments need an
-// object-storage adapter before production; /tmp only prevents startup failure.
+// Avatars live in the database. Attachments use private Vercel Blob when its
+// credentials are configured, with /tmp retained only as a local fallback.
 const { server } = createPlatform(prisma, {
   storageRoot: process.env.VERCEL ? '/tmp/nexa-storage' : undefined,
+  realtime: createRealtimeInfrastructure(),
 });
 
 export default server;

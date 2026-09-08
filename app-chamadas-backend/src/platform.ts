@@ -1,5 +1,6 @@
 import express from 'express';
 import http from 'node:http';
+import { Readable } from 'node:stream';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync } from 'node:fs';
 import { readFile, unlink, writeFile } from 'node:fs/promises';
@@ -8,6 +9,7 @@ import cors from 'cors';
 import bcrypt from 'bcryptjs';
 import multer from 'multer';
 import QRCode from 'qrcode';
+import { del as deleteBlob, get as getBlob, put as putBlob } from '@vercel/blob';
 import { Prisma } from '@prisma/client';
 import type { PrismaClient, User, UserPreference } from '@prisma/client';
 import { Server } from 'socket.io';
@@ -30,9 +32,23 @@ interface SocketData {
   status: PresenceStatus;
   revision: number;
   joining: boolean;
+  typing?: boolean;
+  call?: {
+    id: string;
+    startedAt: string;
+    attemptId: string;
+    microphone: boolean;
+    camera: boolean;
+    screen: boolean;
+    handRaisedAt: string | null;
+  };
 }
 type ClientSocket = Socket<ClientEvents, ServerEvents, Record<string, never>, SocketData>;
-interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string }
+interface RealtimeInfrastructure {
+  initialize: (io: Server) => Promise<void>;
+  withLock: <T>(key: string, task: () => Promise<T>) => Promise<T>;
+}
+interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string; realtime?: RealtimeInfrastructure }
 const MAX_CALL_PARTICIPANTS = 15;
 const VERIFY_DURATION_MS = 60 * 60 * 1000;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -139,11 +155,51 @@ function safeAttachment(file: Express.Multer.File) {
 
 export function createPlatform(prisma: PrismaClient, options: PlatformOptions = {}) {
   const app = express();
+  const backgroundTasks = new Set<Promise<unknown>>();
+  const track = <T>(task: Promise<T>) => {
+    backgroundTasks.add(task);
+    void task.finally(() => backgroundTasks.delete(task));
+    return task;
+  };
+  const whenIdle = async () => {
+    while (backgroundTasks.size) await Promise.allSettled([...backgroundTasks]);
+  };
+  const localLockTails = new Map<string, Promise<void>>();
+  const localLock = async <T>(key: string, task: () => Promise<T>) => {
+    const previous = localLockTails.get(key) ?? Promise.resolve();
+    let release: () => void = () => {};
+    const current = new Promise<void>(resolveLock => { release = resolveLock; });
+    const tail = previous.catch(() => undefined).then(() => current);
+    localLockTails.set(key, tail);
+    await previous.catch(() => undefined);
+    try { return await task(); }
+    finally { release(); if (localLockTails.get(key) === tail) localLockTails.delete(key); }
+  };
+  const withRealtimeLock = options.realtime?.withLock ?? localLock;
   const storageRoot = resolve(options.storageRoot || process.env.UPLOAD_DIR || join(process.cwd(), 'storage'));
   const avatarDirectory = join(storageRoot, 'avatars');
   const fileDirectory = join(storageRoot, 'files');
   mkdirSync(avatarDirectory, { recursive: true });
   mkdirSync(fileDirectory, { recursive: true });
+  const blobStoreId = process.env.BLOB_STORE_ID
+    || Object.entries(process.env).find(([name, value]) => Boolean(value) && /blob.*_STORE_ID$/iu.test(name))?.[1];
+  const blobEnabled = Boolean(process.env.BLOB_READ_WRITE_TOKEN || (process.env.VERCEL_OIDC_TOKEN && blobStoreId));
+  const blobAuth = blobStoreId ? { storeId: blobStoreId } : {};
+  const isBlobReference = (value: string) => /^https:\/\/[^/]+\.blob\.vercel-storage\.com\//u.test(value);
+  const storeAttachment = async (storedName: string, contents: Buffer, mimeType: string) => {
+    if (!blobEnabled) {
+      await writeFile(join(fileDirectory, storedName), contents, { flag: 'wx' });
+      return storedName;
+    }
+    const blob = await putBlob(`nexa/files/${storedName}`, contents, {
+      ...blobAuth, access: 'private', addRandomSuffix: false, contentType: mimeType, cacheControlMaxAge: 60 * 60 * 24 * 30,
+    });
+    return blob.url;
+  };
+  const removeAttachment = async (storedName: string) => {
+    if (isBlobReference(storedName)) await deleteBlob(storedName, blobAuth);
+    else await unlink(join(fileDirectory, basename(storedName)));
+  };
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
   const configuredOrigins = process.env.CORS_ORIGIN?.split(',').map(origin => origin.trim()).filter(Boolean);
   const allowedOrigins: string[] | true = configuredOrigins?.length ? configuredOrigins : true;
@@ -192,6 +248,34 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   };
   const getAuth = (request: express.Request) => (request as express.Request & { auth: NonNullable<Awaited<ReturnType<typeof sessionUser>>> }).auth;
   const memberFor = (request: express.Request, roomId: string) => prisma.roomMember.findUnique({ where: { userId_roomId: { userId: getAuth(request).user.id, roomId } } });
+  const fallbackIceServers = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
+  let turnCache: { expiresAt: number; iceServers: Array<{ urls: string | string[]; username?: string; credential?: string }> } | null = null;
+
+  app.get('/rtc/ice-servers', requireAuth, async (_request, response) => {
+    const keyId = process.env.CLOUDFLARE_TURN_KEY_ID;
+    const apiToken = process.env.CLOUDFLARE_TURN_API_TOKEN;
+    if (!keyId || !apiToken) { response.json({ iceServers: fallbackIceServers }); return; }
+    if (turnCache && turnCache.expiresAt > Date.now()) { response.json({ iceServers: turnCache.iceServers }); return; }
+    try {
+      const cloudflare = await fetch(`https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${apiToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ttl: 86_400 }),
+        signal: AbortSignal.timeout(5_000),
+      });
+      if (!cloudflare.ok) throw new Error(`turn-${cloudflare.status}`);
+      const payload = await cloudflare.json() as { iceServers?: Array<{ urls?: unknown; username?: unknown; credential?: unknown }> };
+      const managed = payload.iceServers?.filter(server => (typeof server.urls === 'string' || (Array.isArray(server.urls) && server.urls.every(url => typeof url === 'string')))
+        && (server.username === undefined || typeof server.username === 'string') && (server.credential === undefined || typeof server.credential === 'string'))
+        .map(server => ({ urls: server.urls as string | string[], ...(typeof server.username === 'string' ? { username: server.username } : {}), ...(typeof server.credential === 'string' ? { credential: server.credential } : {}) })) ?? [];
+      if (!managed.length) throw new Error('turn-empty');
+      turnCache = { expiresAt: Date.now() + 12 * 60 * 60_000, iceServers: managed };
+      response.json({ iceServers: managed });
+    } catch (error) {
+      console.error('Falha ao obter credenciais TURN:', error instanceof Error ? error.message : 'erro desconhecido');
+      response.json({ iceServers: fallbackIceServers });
+    }
+  });
 
   app.post('/auth/register', rateLimiter(30, 15 * 60_000), async (request, response) => {
     const invalid = validationError(request.body);
@@ -436,7 +520,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       if (owned.length) await transaction.room.deleteMany({ where: { id: { in: owned.map(room => room.id) } } });
       await transaction.user.delete({ where: { id: user.id } });
     });
-    await Promise.all(ownedFiles.map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
+    await Promise.all(ownedFiles.map(file => removeAttachment(file.storedName).catch(() => undefined)));
     if (user.avatarPath && !inlineAvatar(user.avatarPath)) await unlink(join(avatarDirectory, basename(user.avatarPath))).catch(() => undefined);
     clearSessionCookie(response); response.status(204).end();
   });
@@ -639,11 +723,12 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   const io = new Server<ClientEvents, ServerEvents, Record<string, never>, SocketData>(server, {
     cors: { origin: allowedOrigins, credentials: true }, maxHttpBufferSize: 256_000,
     pingInterval: 10_000, pingTimeout: 10_000,
+    connectionStateRecovery: { maxDisconnectionDuration: 2 * 60_000, skipMiddlewares: false },
   });
-  const calls = new Map<string, { id: string; startedAt: Date; ready: Promise<unknown>; participants: Map<string, CallParticipant> }>();
-  const typing = new Map<string, Set<string>>();
+  const realtimeReady = options.realtime?.initialize(io as Server) ?? Promise.resolve();
   io.use(async (socket, next) => {
     try {
+      await realtimeReady;
       const auth = await sessionUser(prisma, socket.handshake.headers.cookie, typeof socket.handshake.auth?.token === 'string' ? `Bearer ${socket.handshake.auth.token}` : undefined);
       if (!auth) { next(new Error('unauthorized')); return; }
       socket.data.userId = auth.user.id;
@@ -663,54 +748,65 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     } catch { next(new Error('unauthorized')); }
   });
 
-  function snapshot(sala: string): RoomCall {
-    const call = calls.get(sala);
-    return { sala, callId: call?.id ?? null, startedAt: call?.startedAt.toISOString() ?? null, participants: [...(call?.participants.values() ?? [])] };
+  const participant = (client: { id: string; data: SocketData }): CallParticipant | null => client.data.call ? {
+    socketId: client.id, userId: client.data.userId, username: client.data.username,
+    displayName: client.data.displayName, avatarUrl: client.data.avatarUrl, status: client.data.status, inCall: true,
+    microphone: client.data.call.microphone, camera: client.data.call.camera, screen: client.data.call.screen,
+    attemptId: client.data.call.attemptId, handRaisedAt: client.data.call.handRaisedAt,
+  } : null;
+  async function snapshot(sala: string): Promise<RoomCall> {
+    const clients = await io.in(channelKey(sala)).fetchSockets();
+    const active = clients.map(client => ({ client, participant: participant(client) }))
+      .filter((entry): entry is { client: typeof clients[number]; participant: CallParticipant } => Boolean(entry.participant && entry.client.data.sala === sala));
+    const first = active[0]?.client.data.call;
+    return { sala, callId: first?.id ?? null, startedAt: first?.startedAt ?? null, participants: active.filter(entry => entry.client.data.call?.id === first?.id).map(entry => entry.participant) };
   }
-  function presence(sala: string) {
-    const ids = io.sockets.adapter.rooms.get(presenceKey(sala)) ?? [];
+  async function presence(sala: string) {
+    const clients = await io.in(presenceKey(sala)).fetchSockets();
     const unique = new Map<string, { userId: string; socketId: string; username: string; displayName: string; avatarUrl: string | null; status: PresenceStatus; inCall: boolean }>();
-    for (const id of ids) {
-      const client = io.sockets.sockets.get(id);
-      if (!client?.data.userId) continue;
+    for (const client of clients) {
+      if (!client.data.userId) continue;
       const previous = unique.get(client.data.userId);
-      const inCall = calls.get(sala)?.participants.has(id) ?? false;
+      const inCall = client.data.sala === sala && Boolean(client.data.call);
       if (!previous || inCall) unique.set(client.data.userId, {
-        userId: client.data.userId, socketId: id, username: client.data.username, displayName: client.data.displayName,
+        userId: client.data.userId, socketId: client.id, username: client.data.username, displayName: client.data.displayName,
         avatarUrl: client.data.avatarUrl, status: client.data.status, inCall: inCall || previous?.inCall || false,
       });
     }
     io.to(presenceKey(sala)).emit('usuarios_online', { sala, users: [...unique.values()] });
   }
-  function broadcastCall(sala: string) {
-    io.to(channelKey(sala)).emit('chamada_atualizada', snapshot(sala));
-    presence(sala);
+  async function broadcastCall(sala: string) {
+    io.to(channelKey(sala)).emit('chamada_atualizada', await snapshot(sala));
+    await presence(sala);
   }
-  function broadcastTyping(sala: string) {
+  async function broadcastTyping(sala: string) {
     const users = new Map<string, { userId: string; displayName: string }>();
-    for (const socketId of typing.get(sala) ?? []) {
-      const client = io.sockets.sockets.get(socketId);
-      if (client?.data.userId && client.data.sala === sala) users.set(client.data.userId, { userId: client.data.userId, displayName: client.data.displayName });
+    for (const client of await io.in(channelKey(sala)).fetchSockets()) {
+      if (client.data.typing && client.data.userId && client.data.sala === sala) users.set(client.data.userId, { userId: client.data.userId, displayName: client.data.displayName });
     }
     io.to(channelKey(sala)).emit('usuarios_digitando', { sala, users: [...users.values()] });
   }
   function stopTyping(socket: ClientSocket, sala = socket.data.sala) {
-    if (!sala) return;
-    const active = typing.get(sala); if (!active?.delete(socket.id)) return;
-    if (!active.size) typing.delete(sala); broadcastTyping(sala);
+    if (!sala || !socket.data.typing) return;
+    socket.data.typing = false; void broadcastTyping(sala);
   }
-  function leaveCall(socket: ClientSocket, reason: CallLeft['reason']) {
+  async function leaveCall(socket: ClientSocket, reason: CallLeft['reason']) {
     const sala = socket.data.sala;
-    const call = sala ? calls.get(sala) : undefined;
-    const participant = call?.participants.get(socket.id);
-    if (!sala || !call || !participant) return;
-    call.participants.delete(socket.id);
-    void prisma.callAttendance.updateMany({ where: { callId: call.id, userId: participant.userId, leftAt: null }, data: { leftAt: new Date() } });
-    if (call.participants.size === 0) { calls.delete(sala); void prisma.callHistory.update({ where: { id: call.id }, data: { endedAt: new Date() } }).catch(() => undefined); }
+    const call = socket.data.call;
+    const leaving = participant(socket);
+    if (!sala || !call || !leaving) return;
+    socket.data.call = undefined;
+    await prisma.callAttendance.updateMany({ where: { callId: call.id, userId: leaving.userId, leftAt: null }, data: { leftAt: new Date() } }).catch(() => undefined);
     socket.to(channelKey(sala)).emit('participante_saiu', {
-      sala, callId: call.id, socketId: socket.id, username: participant.username, reason,
+      sala, callId: call.id, socketId: socket.id, username: leaving.username, reason,
     });
-    broadcastCall(sala);
+    await broadcastCall(sala);
+    await withRealtimeLock(`call:${sala}`, async () => {
+      const current = await snapshot(sala);
+      if (current.callId !== call.id) {
+        await prisma.callHistory.updateMany({ where: { id: call.id, endedAt: null }, data: { endedAt: new Date() } });
+      }
+    }).catch(() => undefined);
   }
   function reject(socket: ClientSocket, ack: unknown, error: string, code?: string) {
     if (typeof ack === 'function') (ack as Ack)({ ok: false, error, code });
@@ -718,8 +814,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   }
   function signalTarget(socket: ClientSocket, data: unknown) {
     if (!isRecord(data) || !validId(data.to) || !validId(data.callId) || data.sala !== socket.data.sala) return null;
-    const call = calls.get(socket.data.sala ?? '');
-    if (socket.data.joining || !call || call.id !== data.callId || data.to === socket.id || !call.participants.has(socket.id) || !call.participants.has(data.to)) return null;
+    const call = socket.data.call;
+    if (socket.data.joining || !call || call.id !== data.callId || data.to === socket.id) return null;
     return { to: data.to, sala: socket.data.sala!, callId: call.id, from: socket.id };
   }
   async function mentionIds(roomId: string, text: string) {
@@ -758,7 +854,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
 
   async function removeClientFromRoom(socket: ClientSocket, roomId: string) {
     if (socket.data.sala !== roomId) return;
-    leaveCall(socket, 'room-change'); stopTyping(socket, roomId);
+    await leaveCall(socket, 'room-change'); stopTyping(socket, roomId);
     await socket.leave(channelKey(roomId));
     await socket.leave(presenceKey(roomId));
     socket.data.sala = undefined; socket.data.joining = false; socket.data.revision += 1;
@@ -783,7 +879,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
       await Promise.all([...io.sockets.sockets.values()].filter(socket => room.members.some(member => member.userId === socket.data.userId)).map(socket => socket.leave(presenceKey(roomId))));
       await prisma.room.delete({ where: { id: roomId } });
-      await Promise.all(room.messages.flatMap(message => message.attachments).map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
+      await Promise.all(room.messages.flatMap(message => message.attachments).map(file => removeAttachment(file.storedName).catch(() => undefined)));
       for (const member of room.members) io.to(userKey(member.userId)).emit('sala_removida', { roomId, reason: 'deleted' });
     } else {
       await prisma.roomMember.delete({ where: { userId_roomId: { userId, roomId } } });
@@ -791,7 +887,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
       await Promise.all([...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId).map(socket => socket.leave(presenceKey(roomId))));
       io.to(userKey(userId)).emit('sala_removida', { roomId, reason: 'left' });
-      presence(roomId);
+      void presence(roomId);
     }
     response.status(204).end();
   });
@@ -807,8 +903,13 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     if (!file || !accepted) { response.status(400).json({ error: 'Tipo de arquivo não permitido. Use imagem, PDF, documento, planilha, apresentação, ZIP, TXT ou CSV.' }); return; }
     if (text.length > 4000) { response.status(400).json({ error: 'A legenda deve ter até 4.000 caracteres.' }); return; }
     if (replyToId && !await prisma.mensagem.findFirst({ where: { id: replyToId, roomId } })) { response.status(400).json({ error: 'A mensagem respondida não existe nesta sala.' }); return; }
-    const storedName = `${randomUUID()}${accepted.extension}`;
-    await writeFile(join(fileDirectory, storedName), file.buffer, { flag: 'wx' });
+    const requestedName = `${randomUUID()}${accepted.extension}`;
+    let storedName: string;
+    try { storedName = await storeAttachment(requestedName, file.buffer, accepted.mimeType); }
+    catch (error) {
+      console.error('Falha no armazenamento do anexo:', error instanceof Error ? error.message : 'erro desconhecido');
+      response.status(503).json({ error: 'O armazenamento de arquivos está indisponível. Tente novamente.' }); return;
+    }
     try {
       const mentions = await mentionIds(roomId, text);
       const created = await prisma.mensagem.create({ data: {
@@ -821,7 +922,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       await notifyMessage(created, getAuth(request).user.id);
       response.status(201).json({ message: formatMessage(created, getAuth(request).user.id) });
     } catch (error) {
-      await unlink(join(fileDirectory, storedName)).catch(() => undefined);
+      await removeAttachment(storedName).catch(() => undefined);
       console.error('Falha ao salvar anexo:', error instanceof Error ? error.message : 'erro desconhecido');
       response.status(500).json({ error: 'Não foi possível enviar o arquivo.' });
     }
@@ -832,11 +933,21 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     });
     if (!attachment?.message.roomId || attachment.message.deletedAt || !await memberFor(request, attachment.message.roomId)) { response.status(404).end(); return; }
     try {
-      const contents = await readFile(join(fileDirectory, basename(attachment.storedName)));
       response.type(attachment.mimeType);
-      response.setHeader('Content-Length', String(attachment.size));
       response.setHeader('Content-Disposition', `attachment; filename*=UTF-8''${encodeURIComponent(attachment.name)}`);
-      response.send(contents);
+      response.setHeader('Cache-Control', 'private, no-cache');
+      if (isBlobReference(attachment.storedName)) {
+        const result = await getBlob(attachment.storedName, { ...blobAuth, access: 'private', ifNoneMatch: request.get('if-none-match') });
+        if (!result) { response.status(404).end(); return; }
+        response.setHeader('ETag', result.blob.etag);
+        if (result.statusCode === 304) { response.status(304).end(); return; }
+        response.setHeader('Content-Length', String(result.blob.size ?? attachment.size));
+        Readable.fromWeb(result.stream as never).pipe(response);
+      } else {
+        const contents = await readFile(join(fileDirectory, basename(attachment.storedName)));
+        response.setHeader('Content-Length', String(attachment.size));
+        response.send(contents);
+      }
     } catch { response.status(404).end(); }
   });
 
@@ -865,14 +976,14 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const previousRoom = socket.data.sala;
       const revision = ++socket.data.revision;
       socket.data.joining = true;
-      leaveCall(socket, 'room-change'); stopTyping(socket, previousRoom);
+      await leaveCall(socket, 'room-change'); stopTyping(socket, previousRoom);
       if (previousRoom) await socket.leave(channelKey(previousRoom));
       socket.data.sala = sala;
       await socket.join(channelKey(sala));
       await socket.join(presenceKey(sala));
-      if (previousRoom) presence(previousRoom);
-      presence(sala);
-      socket.emit('chamada_atualizada', snapshot(sala));
+      if (previousRoom) void presence(previousRoom);
+      void presence(sala);
+      socket.emit('chamada_atualizada', await snapshot(sala));
       try {
         const recent = await prisma.mensagem.findMany({ where: { roomId: sala }, include: messageInclude, orderBy: [{ criadoEm: 'desc' }, { id: 'desc' }], take: 51 });
         const hasMore = recent.length > 50;
@@ -949,7 +1060,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const existing = await prisma.mensagem.findFirst({ where: { id: Number(data.messageId), roomId: socket.data.sala, userId: socket.data.userId, deletedAt: null }, include: { attachments: { select: { storedName: true } } } });
       if (!existing) { reject(socket, ack, 'Você só pode excluir suas próprias mensagens.'); return; }
       await prisma.mensagem.update({ where: { id: existing.id }, data: { texto: '', deletedAt: new Date(), mentions: { deleteMany: {} }, attachments: { deleteMany: {} } } });
-      await Promise.all(existing.attachments.map(file => unlink(join(fileDirectory, basename(file.storedName))).catch(() => undefined)));
+      await Promise.all(existing.attachments.map(file => removeAttachment(file.storedName).catch(() => undefined)));
       const updated = await loadMessage(existing.id); const message = formatMessage(updated);
       io.to(channelKey(socket.data.sala!)).emit('mensagem_atualizada', message);
       if (typeof ack === 'function') ack({ ok: true, data: formatMessage(updated, socket.data.userId) });
@@ -961,9 +1072,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     socket.on('digitando', data => {
       if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.typing !== 'boolean' || socket.data.joining) return;
       const sala = socket.data.sala; if (!sala) return;
-      const active = typing.get(sala) ?? new Set<string>();
-      if (data.typing) { active.add(socket.id); typing.set(sala, active); } else { active.delete(socket.id); if (!active.size) typing.delete(sala); }
-      broadcastTyping(sala);
+      socket.data.typing = data.typing;
+      void broadcastTyping(sala);
     });
 
     socket.on('entrar_chamada', async (data: unknown, ack) => {
@@ -973,66 +1083,61 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const sala = socket.data.sala;
       const member = await prisma.roomMember.findUnique({ where: { userId_roomId: { userId: socket.data.userId, roomId: sala } } });
       if (!member) { reject(socket, ack, 'Você não tem acesso a esta sala.'); return; }
-      let call = calls.get(sala);
-      if (call?.participants.has(socket.id) || [...(call?.participants.values() ?? [])].some(participant => participant.userId === socket.data.userId)) {
-        reject(socket, ack, 'Você já está nesta chamada.'); return;
-      }
-      if (call && call.participants.size >= MAX_CALL_PARTICIPANTS) {
-        reject(socket, ack, 'A chamada atingiu o limite de 15 participantes.', 'CALL_FULL'); return;
-      }
-      const isNewCall = !call;
-      if (!call) {
-        const id = randomUUID();
-        const startedAt = new Date();
-        call = { id, startedAt, ready: prisma.callHistory.create({ data: { id, roomId: sala, startedAt } }), participants: new Map() };
-        calls.set(sala, call);
-      }
       try {
-        await call.ready;
-        await prisma.callAttendance.upsert({
-          where: { callId_userId: { callId: call.id, userId: socket.data.userId } },
-          create: { callId: call.id, userId: socket.data.userId },
-          update: { joinedAt: new Date(), leftAt: null },
+        const joined = await withRealtimeLock(`call:${sala}`, async () => {
+          const current = await snapshot(sala);
+          if (current.participants.some(item => item.userId === socket.data.userId)) throw new Error('already-in-call');
+          if (current.participants.length >= MAX_CALL_PARTICIPANTS) throw new Error('call-full');
+          const isNewCall = !current.callId;
+          const callId = current.callId ?? randomUUID();
+          const startedAt = current.startedAt ?? new Date().toISOString();
+          if (isNewCall) {
+            await prisma.callHistory.updateMany({ where: { roomId: sala, endedAt: null }, data: { endedAt: new Date() } });
+            await prisma.callHistory.create({ data: { id: callId, roomId: sala, startedAt: new Date(startedAt) } });
+          }
+          await prisma.callAttendance.upsert({
+            where: { callId_userId: { callId, userId: socket.data.userId } },
+            create: { callId, userId: socket.data.userId },
+            update: { joinedAt: new Date(), leftAt: null },
+          });
+          socket.data.call = {
+            id: callId, startedAt, attemptId: String(data.attemptId),
+            microphone: false, camera: false, screen: false, handRaisedAt: null,
+          };
+          return { call: await snapshot(sala), isNewCall };
         });
-      } catch {
-        if (call.participants.size === 0) calls.delete(sala);
-        reject(socket, ack, 'Não foi possível registrar a chamada. Tente novamente.'); return;
+        if (typeof ack === 'function') ack({ ok: true, data: joined.call });
+        void broadcastCall(sala);
+        if (joined.isNewCall) void notifyCall(sala, joined.call.callId!, socket.data.userId, socket.data.displayName);
+      } catch (error) {
+        if (error instanceof Error && error.message === 'already-in-call') { reject(socket, ack, 'Você já está nesta chamada.'); return; }
+        if (error instanceof Error && error.message === 'call-full') { reject(socket, ack, 'A chamada atingiu o limite de 15 participantes.', 'CALL_FULL'); return; }
+        reject(socket, ack, 'Não foi possível registrar a chamada. Tente novamente.');
       }
-      call.participants.set(socket.id, {
-        socketId: socket.id, userId: socket.data.userId, username: socket.data.username,
-        displayName: socket.data.displayName, avatarUrl: socket.data.avatarUrl, status: socket.data.status, inCall: true,
-        microphone: false, camera: false, screen: false, attemptId: data.attemptId,
-        handRaisedAt: null,
-      });
-      if (typeof ack === 'function') ack({ ok: true, data: snapshot(sala) });
-      broadcastCall(sala);
-      if (isNewCall) void notifyCall(sala, call.id, socket.data.userId, socket.data.displayName);
     });
     socket.on('sair_chamada', (data: unknown) => {
       if (!isRecord(data) || data.sala !== socket.data.sala) return;
-      const participant = calls.get(socket.data.sala ?? '')?.participants.get(socket.id);
-      if (participant?.attemptId === data.attemptId) leaveCall(socket, 'left');
+      if (socket.data.call?.attemptId === data.attemptId) void leaveCall(socket, 'left');
     });
     socket.on('atualizar_midia', (data: unknown) => {
       if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.microphone !== 'boolean' || typeof data.camera !== 'boolean' || typeof data.screen !== 'boolean') return;
-      const participant = calls.get(socket.data.sala ?? '')?.participants.get(socket.id);
-      if (!participant || participant.attemptId !== data.attemptId) return;
-      Object.assign(participant, { microphone: data.microphone, camera: data.camera, screen: data.screen });
-      broadcastCall(socket.data.sala!);
+      const call = socket.data.call;
+      if (!call || call.attemptId !== data.attemptId) return;
+      Object.assign(call, { microphone: data.microphone, camera: data.camera, screen: data.screen });
+      void broadcastCall(socket.data.sala!);
     });
     socket.on('atualizar_mao', (data: unknown) => {
       if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.raised !== 'boolean') return;
-      const participant = calls.get(socket.data.sala ?? '')?.participants.get(socket.id);
-      if (!participant || participant.attemptId !== data.attemptId) return;
-      participant.handRaisedAt = data.raised ? new Date().toISOString() : null;
-      broadcastCall(socket.data.sala!);
+      const call = socket.data.call;
+      if (!call || call.attemptId !== data.attemptId) return;
+      call.handRaisedAt = data.raised ? new Date().toISOString() : null;
+      void broadcastCall(socket.data.sala!);
     });
     socket.on('enviar_reacao', (data: unknown) => {
       const allowed = new Set(['👍', '👏', '❤️', '😂', '🎉', '🤔']);
       if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.emoji !== 'string' || !allowed.has(data.emoji)) return;
-      const call = calls.get(socket.data.sala ?? '');
-      const participant = call?.participants.get(socket.id);
-      if (!call || !participant || participant.attemptId !== data.attemptId) return;
+      const call = socket.data.call;
+      if (!call || call.attemptId !== data.attemptId) return;
       io.to(channelKey(socket.data.sala!)).emit('reacao_chamada', {
         id: randomUUID(), sala: socket.data.sala!, callId: call.id, userId: socket.data.userId,
         username: socket.data.username, displayName: socket.data.displayName, emoji: data.emoji, createdAt: new Date().toISOString(),
@@ -1043,7 +1148,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       socket.data.status = data.status as PresenceStatus;
       await prisma.userPreference.upsert({ where: { userId: socket.data.userId }, create: { userId: socket.data.userId, status: socket.data.status }, update: { status: socket.data.status } });
       for (const client of io.sockets.sockets.values()) if (client.data.userId === socket.data.userId) client.data.status = socket.data.status;
-      for (const room of socket.rooms) if (room.startsWith('presence:')) presence(room.slice('presence:'.length));
+      for (const room of socket.rooms) if (room.startsWith('presence:')) void presence(room.slice('presence:'.length));
     });
     socket.on('atualizar_perfil', async () => {
       const user = await prisma.user.findUnique({ where: { id: socket.data.userId } });
@@ -1055,14 +1160,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         client.data.displayName = displayName; client.data.avatarUrl = picture;
         for (const room of client.rooms) if (room.startsWith('presence:')) affectedRooms.add(room.slice('presence:'.length));
       }
-      for (const [roomId, call] of calls) {
-        let changed = false;
-        for (const participant of call.participants.values()) if (participant.userId === user.id) {
-          participant.displayName = displayName; participant.avatarUrl = picture; changed = true;
-        }
-        if (changed) affectedRooms.add(roomId);
-      }
-      for (const roomId of affectedRooms) { broadcastCall(roomId); presence(roomId); }
+      for (const roomId of affectedRooms) { void broadcastCall(roomId); void presence(roomId); }
     });
     socket.on('webrtc_offer', (data: unknown) => {
       const target = signalTarget(socket, data);
@@ -1088,15 +1186,15 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         usernameFragment: candidate.usernameFragment as string | null ?? null,
       } });
     });
-    socket.on('disconnecting', () => { leaveCall(socket, 'disconnected'); stopTyping(socket); });
+    socket.on('disconnecting', () => { track(leaveCall(socket, 'disconnected')); stopTyping(socket); });
     socket.on('disconnecting', () => {
       const affectedPresence = [...socket.rooms].filter(room => room.startsWith('presence:')).map(room => room.slice('presence:'.length));
-      setTimeout(() => { for (const roomId of affectedPresence) presence(roomId); }, 0);
+      setTimeout(() => { for (const roomId of affectedPresence) void presence(roomId); }, 0);
     });
   });
   app.use((error: unknown, _request: express.Request, response: express.Response, next: express.NextFunction) => {
     if (error instanceof multer.MulterError) { response.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'O arquivo deve ter no máximo 10 MB.' : 'Não foi possível processar o arquivo.' }); return; }
     next(error);
   });
-  return { app, io, server };
+  return { app, io, server, whenIdle };
 }

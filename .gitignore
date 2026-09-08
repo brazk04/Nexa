@@ -30,3 +30,6 @@ Thumbs.db
 .claude/
 .cursor/
 .devin/
+
+.vercel
+.env*

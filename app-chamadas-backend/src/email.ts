@@ -1,4 +1,5 @@
 import nodemailer from 'nodemailer';
+import { verificationEmail } from './email-template';
 
 export interface VerificationMessage { email: string; username: string; token: string }
 export type VerificationSender = (message: VerificationMessage) => Promise<boolean>;
@@ -12,22 +13,18 @@ export function createVerificationSender(): VerificationSender {
     host: SMTP_HOST,
     port: Number(SMTP_PORT),
     secure: process.env.SMTP_SECURE === 'true',
+    requireTLS: process.env.SMTP_SECURE !== 'true',
+    connectionTimeout: 10_000, greetingTimeout: 10_000, socketTimeout: 20_000,
+    disableFileAccess: true, disableUrlAccess: true,
     auth: { user: SMTP_USER, pass: SMTP_PASS },
   });
   const frontendUrl = (process.env.FRONTEND_URL ?? 'http://localhost:5173').replace(/\/$/, '');
   return async ({ email, username, token }) => {
-    const link = `${frontendUrl}/?verify=${encodeURIComponent(token)}`;
-    await transporter.sendMail({
-      from: EMAIL_FROM,
+    const result = await transporter.sendMail({
+      from: { name: 'Nexa', address: EMAIL_FROM.match(/<([^<>]+)>/)?.[1] ?? EMAIL_FROM.trim() },
       to: email,
-      subject: 'Verifique seu e-mail — Coworking Platform',
-      text: `Olá, ${username}. Confirme seu e-mail acessando este link (válido por 1 hora): ${link}`,
-      html: `<p>Olá, <strong>${escapeHtml(username)}</strong>.</p><p>Confirme seu e-mail para acessar a Coworking Platform.</p><p><a href="${link}">Verificar meu e-mail</a></p><p>Este link expira em 1 hora.</p>`,
+      ...verificationEmail(username, token, frontendUrl),
     });
-    return true;
+    return result.accepted.length > 0;
   };
-}
-
-function escapeHtml(value: string) {
-  return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]!);
 }

@@ -8,6 +8,7 @@ interface InstrumentedWindow extends Window {
   __mediaRequests: { audio: boolean; video: boolean }[];
   __notificationRequests: number;
   __notifications: { title: string; body: string; tag: string }[];
+  __installPromptCalls: number;
   __releaseMedia?: () => void;
 }
 async function instrument(page: Page) {
@@ -15,6 +16,7 @@ async function instrument(page: Page) {
     const target = window as unknown as InstrumentedWindow;
     target.__peers = []; target.__streams = []; target.__displays = []; target.__mediaRequests = [];
     target.__notificationRequests = 0; target.__notifications = [];
+    target.__installPromptCalls = 0;
     class FakeNotification {
       static permission: NotificationPermission = 'default';
       static async requestPermission() { target.__notificationRequests += 1; FakeNotification.permission = 'granted'; return 'granted' as NotificationPermission; }
@@ -43,6 +45,7 @@ async function instrument(page: Page) {
       if (constraints.audio) {
         const audioContext = new AudioContext(); const oscillator = audioContext.createOscillator(); const destination = audioContext.createMediaStreamDestination();
         oscillator.connect(destination); oscillator.start();
+        await audioContext.resume();
         const audio = destination.stream.getAudioTracks()[0]; const nativeStop = audio.stop.bind(audio);
         audio.stop = () => { oscillator.stop(); void audioContext.close(); nativeStop(); };
         tracks.push(audio);
@@ -52,10 +55,14 @@ async function instrument(page: Page) {
     navigator.mediaDevices.getDisplayMedia = async () => {
       const stream = videoStream('#145c50'); target.__displays.push(stream); return stream;
     };
+    navigator.mediaDevices.enumerateDevices = async () => [
+      { deviceId: 'mic-test-2', groupId: 'test', kind: 'audioinput', label: 'Microfone de teste 2', toJSON: () => ({}) },
+      { deviceId: 'camera-test-2', groupId: 'test', kind: 'videoinput', label: 'Câmera de teste 2', toJSON: () => ({}) },
+    ];
   });
 }
 async function signup(page: Page, username: string) {
-  await page.goto('/');
+  await page.goto('/login');
   await page.getByRole('button', { name: 'Ainda não tenho uma conta' }).click();
   await page.getByLabel('Nome de usuário', { exact: true }).fill(username);
   await page.getByLabel('Data de nascimento', { exact: true }).fill('1990-01-02');
@@ -98,7 +105,81 @@ async function expectStopped(page: Page) {
     return state.__peers.every(peer => peer.connectionState === 'closed') && [...state.__streams, ...state.__displays].every(stream => stream.getTracks().every(track => track.readyState === 'ended'));
   })).toBe(true);
 }
+async function expectRemoteAudio(page: Page, name: string) {
+  const tile = page.locator('.video-tile').filter({ has: page.locator('.video-caption strong', { hasText: name }) });
+  await expect.poll(() => tile.locator('audio').evaluate(element => {
+    const video = element as HTMLVideoElement;
+    const stream = video.srcObject as MediaStream | null;
+    return { muted: video.muted, paused: video.paused, audio: stream?.getAudioTracks().map(track => ({ state: track.readyState, muted: track.muted })) };
+  })).toEqual({ muted: false, paused: false, audio: [{ state: 'live', muted: false }] });
+  await expect.poll(() => page.evaluate(async () => {
+    const peers = (window as unknown as InstrumentedWindow).__peers.filter(peer => peer.connectionState === 'connected');
+    const reports = await Promise.all(peers.map(peer => peer.getStats()));
+    return reports.some(report => [...report.values()].some(item => item.type === 'inbound-rtp' && item.kind === 'audio' && item.totalAudioEnergy > 0 && item.packetsReceived > 0));
+  })).toBe(true);
+}
 async function closeAll(contexts: BrowserContext[]) { await Promise.all(contexts.map(context => context.close())); }
+
+test('idioma da landing alterna, persiste e funciona no celular', async ({ page }) => {
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Switch to English', exact: true }).click();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('A place for your team.Even from afar.');
+  await expect(page.locator('.landing-footer')).toContainText('Conversations, meetings and teamwork.');
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Mudar para português', exact: true })).toBeVisible();
+  for (const width of [320, 375, 430, 768, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    await expect(page.getByRole('button', { name: 'Mudar para português', exact: true })).toBeVisible();
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  }
+  await page.locator('.landing-actions').getByRole('link', { name: 'Get started', exact: true }).click();
+  await expect(page).toHaveURL(/\/register$/);
+  await expect(page.getByRole('button', { name: 'Criar conta', exact: true })).toBeVisible();
+  await expect(page.locator('html')).toHaveAttribute('lang', 'pt-BR');
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Mudar para português', exact: true }).click();
+  await expect(page.getByRole('heading', { level: 1 })).toContainText('O lugar da sua equipe.');
+  await page.reload();
+  await expect(page.getByRole('button', { name: 'Switch to English', exact: true })).toBeVisible();
+});
+
+test('capturas reais para a landing e navegação responsiva', async ({ browser }) => {
+  const demo = await person(browser, 'EquipeNexa');
+  try {
+    await demo.page.emulateMedia({ colorScheme: 'dark' });
+    await demo.page.setViewportSize({ width: 1440, height: 960 });
+    await createRoom(demo.page, 'Planejamento');
+    const dismiss = demo.page.getByRole('button', { name: 'Agora não', exact: true });
+    if (await dismiss.isVisible()) await dismiss.click();
+    for (const message of ['Bom dia, equipe! Este é o nosso espaço de planejamento.', 'Vamos reunir as ideias para a próxima entrega por aqui.', 'A pauta está na central da reunião. Depois da conversa, registramos as decisões e os próximos passos.']) {
+      await demo.page.getByRole('textbox', { name: 'Mensagem para Planejamento' }).fill(message);
+      await demo.page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
+      await expect(demo.page.getByText(message, { exact: true })).toBeVisible();
+    }
+    await demo.page.screenshot({ path: 'public/screenshots/chat.png', animations: 'disabled' });
+    await demo.page.getByRole('button', { name: 'Convidar e organizar' }).click();
+    await demo.page.getByRole('button', { name: 'Reunião', exact: true }).click();
+    await demo.page.getByPlaceholder('Novo item').fill('Alinhar prioridades da próxima entrega');
+    await demo.page.getByRole('button', { name: '+ Pauta', exact: true }).click();
+    await expect(demo.page.getByText('Alinhar prioridades da próxima entrega', { exact: true })).toBeVisible();
+    await demo.page.screenshot({ path: 'public/screenshots/meeting.png', animations: 'disabled' });
+  } finally { await demo.context.close(); }
+  const context = await browser.newContext(); const page = await context.newPage();
+  try {
+    for (const width of [320, 375, 390, 430, 768, 1440, 2560]) {
+      await page.setViewportSize({ width, height: 960 }); await page.goto('/');
+      await expect(page.getByRole('heading', { level: 1 })).toContainText('O lugar da sua equipe.');
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+      if (width <= 800) { await page.getByRole('button', { name: 'Menu', exact: true }).click(); await expect(page.getByRole('navigation', { name: 'Navegação principal' })).toBeVisible(); }
+      await page.getByRole('navigation', { name: 'Navegação principal' }).getByRole('link', { name: 'Funcionalidades' }).click();
+      await expect(page).toHaveURL(/#funcionalidades$/);
+    }
+    await page.locator('.landing-actions').getByRole('link', { name: 'Começar agora', exact: true }).click();
+    await expect(page.getByLabel('Nome de usuário', { exact: true })).toBeVisible();
+    await expect(page.getByRole('button', { name: 'Criar conta', exact: true })).toBeVisible();
+  } finally { await context.close(); }
+});
 
 test('cadastro verificado, salas por código, chat persistente, isolamento e logout', async ({ browser }) => {
   const alice = await person(browser, 'AliceWeb');
@@ -130,13 +211,29 @@ test('cadastro verificado, salas por código, chat persistente, isolamento e log
     await bruno.page.reload();
     await expect(bruno.page.getByRole('log').getByText(message, { exact: true })).toBeVisible();
     await bruno.page.getByRole('button', { name: 'Sair da conta', exact: true }).click();
-    await expect(bruno.page.getByRole('heading', { name: 'Entre na sua conta.' })).toBeVisible();
+    await expect(bruno.page.getByRole('heading', { level: 1 })).toContainText('O lugar da sua equipe.');
   } finally { await closeAll(contexts); }
 });
 
 test('notificações do computador, contador na aba e ações de sala', async ({ browser }) => {
   const alice = await person(browser, 'AliceNotify'); const contexts = [alice.context];
   try {
+    const manifestResponse = await alice.page.request.get('/manifest.webmanifest');
+    expect(manifestResponse.ok()).toBeTruthy();
+    const manifest = await manifestResponse.json() as { name: string; display: string; icons: { sizes: string }[] };
+    expect(manifest.name).toBe('Nexa'); expect(manifest.display).toBe('standalone');
+    expect(manifest.icons.map(icon => icon.sizes)).toEqual(expect.arrayContaining(['192x192', '512x512']));
+    await alice.page.evaluate(() => {
+      const target = window as unknown as InstrumentedWindow;
+      const event = new Event('beforeinstallprompt', { cancelable: true });
+      Object.assign(event, {
+        prompt: async () => { target.__installPromptCalls += 1; },
+        userChoice: Promise.resolve({ outcome: 'accepted', platform: 'web' }),
+      });
+      window.dispatchEvent(event);
+    });
+    await alice.page.getByRole('button', { name: 'Instalar Nexa', exact: true }).click();
+    await expect.poll(() => alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__installPromptCalls)).toBe(1);
     const firstCode = await createRoom(alice.page, 'Sala Alertas');
     const bruno = await person(browser, 'BrunoNotify', { code: firstCode, name: 'Sala Alertas' }); contexts.push(bruno.context);
     const secondCode = await createRoom(alice.page, 'Sala Atual');
@@ -181,6 +278,11 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     expect(await bruno.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
     await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
     await expect(alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true })).toBeEnabled();
+    await bruno.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
+    await expectRemoteAudio(bruno.page, 'AliceCall'); await expectRemoteAudio(alice.page, 'BrunoCall');
+    await alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true }).click();
+    expect(await alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__streams.flatMap(stream => stream.getAudioTracks()).every(track => !track.enabled))).toBe(true);
+    await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
     await alice.page.getByRole('button', { name: 'Ligar câmera', exact: true }).click();
     await expect(alice.page.getByRole('button', { name: 'Desligar câmera', exact: true })).toBeEnabled();
     expect(await alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([
@@ -203,6 +305,22 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await carla.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
     await expectConnectedPeers(alice.page, 2); await expectConnectedPeers(bruno.page, 2); await expectConnectedPeers(carla.page, 2);
     await expect(carla.page.getByText('Compartilhando tela', { exact: true })).toBeVisible();
+    await expectRemoteAudio(carla.page, 'AliceCall'); await expectRemoteAudio(bruno.page, 'AliceCall');
+    await alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true }).click();
+    await alice.page.getByRole('button', { name: 'Configurações', exact: true }).click();
+    await alice.page.getByRole('button', { name: 'Áudio e vídeo', exact: true }).click();
+    await alice.page.getByRole('combobox', { name: /^Microfone/ }).selectOption('mic-test-2');
+    await alice.page.getByRole('combobox', { name: /^Câmera/ }).selectOption('camera-test-2');
+    await alice.page.getByRole('button', { name: 'Salvar dispositivos', exact: true }).click();
+    await expect.poll(() => alice.page.evaluate(() => {
+      const target = window as unknown as InstrumentedWindow;
+      const tracks = target.__streams.flatMap(stream => stream.getAudioTracks());
+      const latest = tracks.at(-1);
+      return tracks.length === 2 && tracks[0].readyState === 'ended' && latest?.enabled === false && target.__peers.filter(peer => peer.connectionState === 'connected').every(peer => peer.getSenders().some(sender => sender.track === latest));
+    })).toBe(true);
+    await alice.page.getByRole('dialog', { name: 'Configurações' }).getByRole('button', { name: 'Fechar', exact: true }).click();
+    await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
+    await expectRemoteAudio(carla.page, 'AliceCall');
     await expect.poll(() => alice.page.evaluate(() => {
       const state = window as unknown as InstrumentedWindow;
       const screen = state.__displays[0].getVideoTracks()[0];
@@ -220,6 +338,16 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await bruno.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
     await expect(alice.page.getByText('BrunoCall saiu da chamada.', { exact: true })).toBeVisible();
     await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1); await expectStopped(bruno.page);
+    await expectRemoteAudio(carla.page, 'AliceCall');
+    const disconnected = await alice.page.request.post('http://127.0.0.1:3355/__test/disconnect/AliceCall');
+    expect(disconnected.ok()).toBe(true);
+    await expectStopped(alice.page);
+    await expect(alice.page.getByText('A conexão caiu. Entre novamente na chamada após reconectar.', { exact: true })).toBeVisible();
+    await expect(alice.page.getByRole('button', { name: 'Entrar na chamada', exact: true })).toBeEnabled();
+    await alice.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
+    await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1);
+    await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
+    await expectRemoteAudio(carla.page, 'AliceCall');
     await alice.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
     await carla.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
     await expectStopped(alice.page); await expectStopped(carla.page);
@@ -255,7 +383,7 @@ test('layout móvel mantém login, marca, chat e anexos dentro da viewport', asy
   try {
     for (const width of [320, 375, 390, 430]) {
       await page.setViewportSize({ width, height: 844 });
-      await page.goto('/');
+      await page.goto('/login');
       await expect(page.locator('.entry-copy .nexa-logo')).toHaveCount(1);
       await expect(page.locator('.entry-page .entry-brand .nexa-logo')).toHaveCount(0);
       expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);

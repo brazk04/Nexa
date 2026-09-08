@@ -7,10 +7,14 @@ type Connection = 'connecting' | 'joining' | 'connected' | 'idle' | 'error';
 
 function mergeMessages(first: Message[], second: Message[]) {
   const merged = [...first];
+  const ids = new Map(first.map((message, index) => [message.id, index]));
+  const clientIds = new Map(first.filter(message => message.clientMessageId).map(message => [message.clientMessageId, ids.get(message.id)!]));
   for (const message of second) {
-    const index = merged.findIndex(item => item.id === message.id || Boolean(message.clientMessageId && item.clientMessageId === message.clientMessageId));
-    if (index >= 0) merged[index] = { ...merged[index], ...message };
+    const index = ids.get(message.id) ?? (message.clientMessageId ? clientIds.get(message.clientMessageId) : undefined);
+    if (index !== undefined) merged[index] = { ...merged[index], ...message };
     else merged.push(message);
+    const position = index ?? merged.length - 1;
+    ids.set(message.id, position); if (message.clientMessageId) clientIds.set(message.clientMessageId, position);
   }
   return merged.sort((a, b) => new Date(a.criadoEm).getTime() - new Date(b.criadoEm).getTime() || a.id - b.id);
 }
@@ -64,7 +68,7 @@ export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser
     };
     const onHistory = (history: History) => {
       if (history.sala !== roomRef.current || history.requestId !== requestRef.current) return;
-      setMessages(previous => mergeMessages(history.mensagens.map(confirmed), previous));
+      setMessages(previous => mergeMessages(previous, history.mensagens.map(confirmed)));
       setHasMore(history.hasMore); setStatus('connected'); setError('');
     };
     const onMessage = (message: Message) => {
@@ -115,7 +119,7 @@ export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser
   const persistMessage = useCallback(async (sala: string, texto: string, replyToId: number | null, clientMessageId: string) => {
     const result: Result<Message> = await socket.timeout(10_000).emitWithAck('mensagem_chat', { sala, texto, replyToId, clientMessageId });
     if (!result.ok) throw new Error(result.error);
-    setMessages(previous => mergeMessages(previous, [confirmed(result.data)]));
+    if (roomRef.current === sala) setMessages(previous => mergeMessages(previous, [confirmed(result.data)]));
   }, [socket]);
   const sendMessage = useCallback(async (texto: string, replyToId?: number | null) => {
     if (!roomRef.current || !socket.connected || status !== 'connected') throw new Error('Espere a conexão com a sala para enviar.');

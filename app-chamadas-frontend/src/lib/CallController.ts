@@ -1,4 +1,5 @@
 import type { AppSocket } from './socket';
+import { api } from './api';
 import type { CallLeft, CallParticipant, CallReaction, Description, IceCandidate, MediaState, Result, RoomCall, SignalSource } from '../../../shared/protocol';
 
 export type CallPhase = 'idle' | 'media' | 'waiting' | 'connecting' | 'connected' | 'reconnecting';
@@ -66,8 +67,10 @@ export class CallController {
   private displayStream: MediaStream | null = null;
   private screenOperation = false;
   private devices = { cameraId: '', microphoneId: '' };
+  private deviceChanges: Promise<void> = Promise.resolve();
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   private reactionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private iceServers: RTCIceServer[] = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
 
   constructor(socket: AppSocket) { this.socket = socket; }
   getSnapshot = () => this.state;
@@ -84,8 +87,57 @@ export class CallController {
   }
   dismissNotice = () => this.update({ error: '', notice: '' });
   configureDevices = (devices: { cameraId?: string; microphoneId?: string }) => {
+    const previous = this.devices;
     this.devices = { cameraId: devices.cameraId ?? '', microphoneId: devices.microphoneId ?? '' };
+    const next = this.devices;
+    const generation = this.generation;
+    this.deviceChanges = this.deviceChanges.then(async () => {
+      if (!this.current(generation)) return;
+      if (previous.microphoneId !== next.microphoneId) await this.switchDevice('microphone', next.microphoneId, generation);
+      if (previous.cameraId !== next.cameraId) await this.switchDevice('camera', next.cameraId, generation);
+    }).catch(() => { if (this.current(generation)) this.update({ error: 'Não foi possível trocar o dispositivo. Tente novamente.' }); });
   };
+
+  private refreshLocalStream() {
+    this.update({ localStream: new MediaStream([
+      ...(this.cameraStream?.getAudioTracks() ?? []),
+      ...((this.displayStream ?? this.cameraStream)?.getVideoTracks() ?? []),
+    ]) });
+  }
+  private async switchDevice(kind: UserMediaKind, deviceId: string, generation: number) {
+    const oldTrack = kind === 'microphone' ? this.cameraStream?.getAudioTracks()[0] : this.cameraStream?.getVideoTracks()[0];
+    // Selecting a device must never acquire media before explicit activation.
+    if (!oldTrack || !this.current(generation)) return;
+    if (kind === 'camera' && this.screenOperation) { this.update({ notice: 'Aguarde o compartilhamento terminar de mudar e selecione a câmera novamente.' }); return; }
+    this.update(kind === 'microphone' ? { microphoneBusy: true } : { cameraBusy: true });
+    let replacement: MediaStreamTrack | undefined;
+    const senders = () => [...this.peers.values()].map(peer => kind === 'microphone' ? peer.audioSender : this.displayStream ? null : peer.videoSender).filter((sender): sender is RTCRtpSender => Boolean(sender));
+    try {
+      const constraint = deviceId ? { deviceId: { exact: deviceId } } : true;
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: kind === 'microphone' ? constraint : false, video: kind === 'camera' ? constraint : false });
+      replacement = kind === 'microphone' ? stream.getAudioTracks()[0] : stream.getVideoTracks()[0];
+      stream.getTracks().filter(track => track !== replacement).forEach(track => track.stop());
+      if (!replacement) throw new Error('MissingTrack');
+      if (!this.current(generation)) { replacement.stop(); oldTrack.onended = null; oldTrack.stop(); return; }
+      replacement.enabled = oldTrack.enabled;
+      this.cameraStream?.removeTrack(oldTrack); this.cameraStream?.addTrack(replacement);
+      await Promise.all(senders().map(sender => sender.replaceTrack(replacement!)));
+      if (!this.current(generation)) { replacement.stop(); oldTrack.onended = null; oldTrack.stop(); return; }
+      const track = replacement;
+      track.onended = () => this.onDeviceEnded(kind, track, generation);
+      oldTrack.onended = null; oldTrack.stop();
+      this.refreshLocalStream(); this.publishMedia();
+    } catch (error) {
+      if (this.current(generation)) {
+        if (replacement) this.cameraStream?.removeTrack(replacement);
+        this.cameraStream?.addTrack(oldTrack);
+        await Promise.all(senders().map(sender => sender.replaceTrack(oldTrack).catch(() => undefined)));
+        this.update({ error: userMediaError(error, kind) });
+      }
+      replacement?.stop();
+      if (!this.current(generation)) { oldTrack.onended = null; oldTrack.stop(); }
+    } finally { if (this.current(generation)) this.update(kind === 'microphone' ? { microphoneBusy: false } : { cameraBusy: false }); }
+  }
 
   private clearPeerTimers(context: PeerContext) {
     if (context.disconnectTimer) clearTimeout(context.disconnectTimer);
@@ -132,7 +184,7 @@ export class CallController {
   private makePeer(peerId: string, generation: number) {
     const existing = this.peers.get(peerId);
     if (existing) return existing;
-    const connection = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+    const connection = new RTCPeerConnection({ iceServers: this.iceServers });
     const audioTrack = this.cameraStream?.getAudioTracks()[0];
     const videoTrack = this.displayStream?.getVideoTracks()[0] ?? this.cameraStream?.getVideoTracks()[0];
     const audioSender = connection.addTransceiver(audioTrack ?? 'audio', {
@@ -148,10 +200,12 @@ export class CallController {
       if (this.current(generation) && event.candidate) this.socket.emit('webrtc_ice_candidate', { ...this.target(peerId), candidate: event.candidate.toJSON() as IceCandidate });
     };
     connection.ontrack = event => {
-      if (!this.current(generation)) return;
+      if (!this.current(generation) || this.peers.get(peerId) !== context) return;
       const current = this.state.remoteStreams[peerId];
-      const stream = event.streams[0] ?? current ?? new MediaStream();
-      if (!stream.getTracks().includes(event.track)) stream.addTrack(event.track);
+      // Audio and screen video can have different SDP stream IDs. Own one
+      // aggregate per peer instead of replacing audio with the last event stream.
+      const tracks = (current?.getTracks() ?? []).filter(track => track.kind !== event.track.kind && track.readyState !== 'ended');
+      const stream = new MediaStream([...tracks, event.track]);
       this.update({ remoteStreams: { ...this.state.remoteStreams, [peerId]: stream } });
     };
     const onState = () => {
@@ -186,9 +240,9 @@ export class CallController {
   private queuePeer(peerId: string, task: (context: PeerContext, generation: number) => Promise<void>) {
     const generation = this.generation;
     const context = this.makePeer(peerId, generation);
-    context.chain = context.chain.then(async () => { if (this.current(generation)) await task(context, generation); }).catch(error => {
-      console.error('Falha na sinalização:', error);
-      if (this.current(generation)) { this.closePeer(peerId); this.update({ notice: 'Não foi possível negociar com um participante.' }); this.updatePhase(); }
+    context.chain = context.chain.then(async () => { if (this.current(generation) && this.peers.get(peerId) === context) await task(context, generation); }).catch(error => {
+      console.error('Falha na sinalização:', error instanceof Error ? error.name : 'UnknownError');
+      if (this.current(generation) && this.peers.get(peerId) === context) { this.closePeer(peerId); this.update({ notice: 'Não foi possível negociar com um participante.' }); this.updatePhase(); }
     });
   }
   private flushCandidates = async (context: PeerContext, generation: number) => {
@@ -211,6 +265,9 @@ export class CallController {
     this.room = sala; this.attemptId = crypto.randomUUID();
     this.update({ ...idleState(), phase: 'media' });
     try {
+      const configuration = await api<{ iceServers: RTCIceServer[] }>('/rtc/ice-servers').catch(() => null);
+      if (configuration?.iceServers.length) this.iceServers = configuration.iceServers;
+      if (!this.current(generation)) return;
       const stream = new MediaStream();
       this.cameraStream = stream; this.update({ localStream: stream });
       const result: Result<RoomCall> = await this.socket.timeout(10_000).emitWithAck('entrar_chamada', { sala, attemptId: this.attemptId });
@@ -261,15 +318,15 @@ export class CallController {
       this.cameraStream?.addTrack(track); track.onended = () => this.onDeviceEnded('microphone', track, generation);
       await Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(track)));
       if (!this.current(generation)) { track.onended = null; track.stop(); return; }
-      this.update({ microphone: true }); this.publishMedia();
+      this.refreshLocalStream(); this.update({ microphone: true }); this.publishMedia();
     } catch (error) {
       stream?.getTracks().forEach(track => { this.cameraStream?.removeTrack(track); track.onended = null; track.stop(); });
-      await Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(null).catch(() => undefined)));
+      if (this.current(generation)) await Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(null).catch(() => undefined)));
       if (this.current(generation)) this.update({ error: userMediaError(error, 'microphone') });
     } finally { if (this.current(generation)) this.update({ microphoneBusy: false }); }
   };
   toggleCamera = async () => {
-    if (this.state.phase === 'idle' || this.state.cameraBusy) return;
+    if (this.state.phase === 'idle' || this.state.cameraBusy || this.screenOperation) return;
     const currentTrack = this.cameraStream?.getVideoTracks()[0];
     if (currentTrack) {
       const camera = !this.state.camera;
@@ -291,10 +348,10 @@ export class CallController {
       this.cameraStream?.addTrack(track); track.onended = () => this.onDeviceEnded('camera', track, generation);
       if (!this.displayStream) await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(track)));
       if (!this.current(generation)) { track.onended = null; track.stop(); return; }
-      this.update({ camera: true }); this.publishMedia();
+      this.refreshLocalStream(); this.update({ camera: true }); this.publishMedia();
     } catch (error) {
       stream?.getTracks().forEach(track => { this.cameraStream?.removeTrack(track); track.onended = null; track.stop(); });
-      if (!this.displayStream) await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(null).catch(() => undefined)));
+      if (this.current(generation) && !this.displayStream) await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(null).catch(() => undefined)));
       if (this.current(generation)) this.update({ error: userMediaError(error, 'camera') });
     } finally { if (this.current(generation)) this.update({ cameraBusy: false }); }
   };
@@ -357,7 +414,7 @@ export class CallController {
     }
   };
   toggleScreen = async () => {
-    if (this.state.phase === 'idle' || this.screenOperation) return;
+    if (this.state.phase === 'idle' || this.screenOperation || this.state.cameraBusy) return;
     const generation = this.generation;
     if (this.displayStream) { await this.restoreCamera(generation); return; }
     if (!navigator.mediaDevices?.getDisplayMedia) { this.update({ error: 'Este navegador não oferece compartilhamento de tela.' }); return; }
@@ -372,7 +429,7 @@ export class CallController {
       await Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(track)));
       if (!this.current(generation)) return;
       if (display.getVideoTracks().some(item => item.readyState === 'ended')) { await this.restoreCamera(generation); return; }
-      this.update({ localStream: display, screen: true }); this.publishMedia();
+      this.refreshLocalStream(); this.update({ screen: true }); this.publishMedia();
     } catch (error) {
       console.error('Falha no compartilhamento:', error);
       display?.getTracks().forEach(track => { track.onended = null; track.stop(); });
@@ -390,6 +447,19 @@ export class CallController {
       this.armHandshake(data.from, generation); this.updatePhase();
       await context.connection.setRemoteDescription(data.offer);
       if (!this.current(generation)) return;
+      // A transceiver created without a track may not be reused for the remote
+      // m-line. Bind the senders to the negotiated transceivers, not orphans.
+      for (const transceiver of context.connection.getTransceivers()) {
+        if (transceiver.mid === null) continue;
+        transceiver.direction = 'sendrecv';
+        if (transceiver.receiver.track.kind === 'audio') {
+          context.audioSender = transceiver.sender;
+          await transceiver.sender.replaceTrack(this.cameraStream?.getAudioTracks()[0] ?? null);
+        } else if (transceiver.receiver.track.kind === 'video') {
+          context.videoSender = transceiver.sender;
+          await transceiver.sender.replaceTrack((this.displayStream ?? this.cameraStream)?.getVideoTracks()[0] ?? null);
+        }
+      }
       await this.flushCandidates(context, generation);
       const answer = await context.connection.createAnswer();
       if (!this.current(generation)) return;

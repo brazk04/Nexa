@@ -45,7 +45,8 @@ export interface Description { type: 'offer' | 'answer'; sdp: string }
 export interface IceCandidate { candidate: string; sdpMid?: string | null; sdpMLineIndex?: number | null; usernameFragment?: string | null }
 export interface SignalTarget { sala: string; callId: string; to: string }
 export interface SignalSource { sala: string; callId: string; from: string }
-export interface CallLeft { sala: string; callId: string; socketId: string; username: string; reason: 'left' | 'room-change' | 'disconnected' }
+export interface CallLeft { sala: string; callId: string; socketId: string; username: string; reason: 'manual' | 'room-change' | 'timeout' }
+export interface CallConnectivity { sala: string; callId: string; socketId: string; userId: string; username: string; status: 'reconnecting' | 'connected' }
 export interface ClientEvents {
   entrar_sala: (request: RoomRequest, ack: Ack) => void;
   mensagem_chat: (message: { sala: string; texto: string; replyToId?: number | null; clientMessageId?: string }, ack: Ack<Message>) => void;
@@ -53,6 +54,7 @@ export interface ClientEvents {
   excluir_mensagem: (request: { sala: string; messageId: number }, ack: Ack<Message>) => void;
   marcar_sala_lida: (request: { sala: string }) => void;
   entrar_chamada: (request: CallRequest, ack: Ack<RoomCall>) => void;
+  sincronizar_chamada: (request: CallRequest, ack: Ack<RoomCall>) => void;
   sair_chamada: (request: CallRequest) => void;
   atualizar_midia: (request: CallRequest & MediaState) => void;
   atualizar_mao: (request: CallRequest & { raised: boolean }) => void;
@@ -76,6 +78,7 @@ export interface ServerEvents {
   chamada_atualizada: (call: RoomCall) => void;
   reacao_chamada: (reaction: CallReaction) => void;
   participante_saiu: (event: CallLeft) => void;
+  conexao_participante: (event: CallConnectivity) => void;
   webrtc_offer: (data: SignalSource & { offer: Description }) => void;
   webrtc_answer: (data: SignalSource & { answer: Description }) => void;
   webrtc_ice_candidate: (data: SignalSource & { candidate: IceCandidate }) => void;

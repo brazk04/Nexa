@@ -99,6 +99,9 @@ async function expectConnectedPeers(page: Page, count: number) {
   await expect(page.getByText('Chamada conectada', { exact: true })).toBeVisible({ timeout: 25_000 });
   await expect.poll(() => page.evaluate(() => (window as unknown as InstrumentedWindow).__peers.filter(peer => peer.connectionState === 'connected').length)).toBe(count);
 }
+async function expectConnectedPeersAtLeast(page: Page, count: number) {
+  await expect.poll(() => page.evaluate(() => (window as unknown as InstrumentedWindow).__peers.filter(peer => peer.connectionState === 'connected').length)).toBeGreaterThanOrEqual(count);
+}
 async function expectStopped(page: Page) {
   await expect.poll(() => page.evaluate(() => {
     const state = window as unknown as InstrumentedWindow;
@@ -202,6 +205,17 @@ test('cadastro verificado, salas por código, chat persistente, isolamento e log
     await expect(alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true })).toBeFocused();
     await expect(alice.page.getByRole('log').getByText(message, { exact: true })).toHaveCount(1);
     await expect(bruno.page.getByRole('log').getByText(message, { exact: true })).toBeVisible();
+    let historyReloads = 0;
+    alice.page.on('request', request => { if (/\/rooms\/[^/]+\/messages(?:\?|$)/.test(request.url())) historyReloads++; });
+    for (let index = 0; index < 8; index++) {
+      await alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true }).fill(`Rajada ${index}`);
+      await alice.page.getByLabel('Mensagem para Projeto Alpha', { exact: true }).press('Enter');
+    }
+    for (let index = 0; index < 8; index++) {
+      await expect(alice.page.getByRole('log').getByText(`Rajada ${index}`, { exact: true })).toHaveCount(1);
+      await expect(bruno.page.getByRole('log').getByText(`Rajada ${index}`, { exact: true })).toHaveCount(1);
+    }
+    expect(historyReloads).toBe(0);
     await alice.page.getByRole('button', { name: 'Configurações', exact: true }).click();
     await alice.page.getByRole('button', { name: 'Aparência', exact: true }).click();
     await alice.page.getByLabel('Tema').selectOption('light');
@@ -266,14 +280,27 @@ test('notificações do computador, contador na aba e ações de sala', async ({
 });
 
 test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e maximização', async ({ browser }) => {
+  test.setTimeout(140_000);
   const alice = await person(browser, 'AliceCall'); const contexts = [alice.context];
   try {
     const code = await createRoom(alice.page, 'Sala Mesh');
-    const bruno = await person(browser, 'BrunoCall', { code, name: 'Sala Mesh' }); contexts.push(bruno.context);
-    const carla = await person(browser, 'CarlaCall', { code, name: 'Sala Mesh' }); contexts.push(carla.context);
     await alice.page.getByRole('button', { name: 'Iniciar chamada', exact: true }).click();
+    const bruno = await person(browser, 'BrunoCall', { code, name: 'Sala Mesh' }); contexts.push(bruno.context);
+    await expect(bruno.page.getByRole('button', { name: 'Entrar na chamada', exact: true })).toBeVisible();
     await bruno.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
     await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(bruno.page, 1);
+    await createRoom(alice.page, 'Sala Paralela');
+    await expect(alice.page.getByText('Chamada conectada', { exact: true })).toBeVisible();
+    await alice.page.getByLabel('Mensagem para Sala Paralela', { exact: true }).fill('A chamada da Sala Mesh continua ativa.');
+    await alice.page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
+    await expect(alice.page.getByText('A chamada da Sala Mesh continua ativa.', { exact: true })).toBeVisible();
+    await alice.page.getByRole('button', { name: 'Iniciar chamada', exact: true }).click();
+    await expect(alice.page.getByText('Você já está em uma chamada em outra sala. Saia da chamada atual antes de entrar em outra.', { exact: true })).toBeVisible();
+    await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(bruno.page, 1);
+    await alice.page.locator('.desktop-sidebar .channel-item').filter({ hasText: 'Sala Mesh' }).click();
+    await expect(alice.page.locator('.room-header').getByRole('heading', { name: 'Sala Mesh' })).toBeVisible();
+    await expectConnectedPeers(alice.page, 1);
+    const carla = await person(browser, 'CarlaCall', { code, name: 'Sala Mesh' }); contexts.push(carla.context);
     expect(await alice.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
     expect(await bruno.page.evaluate(() => (window as unknown as InstrumentedWindow).__mediaRequests)).toEqual([]);
     await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
@@ -304,6 +331,20 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await expect(alice.page.getByRole('button', { name: 'Parar compartilhamento', exact: true })).toBeEnabled();
     await carla.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
     await expectConnectedPeers(alice.page, 2); await expectConnectedPeers(bruno.page, 2); await expectConnectedPeers(carla.page, 2);
+    await alice.context.setOffline(true);
+    await expect(alice.page.getByText('Sua conexão caiu. Tentando reconectar…', { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(bruno.page.getByText('AliceCall perdeu a conexão. Aguardando reconexão…', { exact: true })).toBeVisible({ timeout: 30_000 });
+    // The signaling socket is offline, but an already-established WebRTC path may
+    // remain connected. The other participants must stay together either way.
+    await expectConnectedPeersAtLeast(bruno.page, 1); await expectConnectedPeersAtLeast(carla.page, 1);
+    await expect(bruno.page.getByText('AliceCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    await expect(carla.page.getByText('AliceCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    await alice.context.setOffline(false);
+    await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toBeVisible();
+    await expect(bruno.page.getByText('AliceCall se reconectou.', { exact: true })).toBeVisible();
+    await expectConnectedPeers(alice.page, 2); await expectConnectedPeers(bruno.page, 2); await expectConnectedPeers(carla.page, 2);
+    await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toHaveCount(0, { timeout: 7_000 });
+    await expect(bruno.page.getByText('AliceCall se reconectou.', { exact: true })).toHaveCount(0, { timeout: 7_000 });
     await expect(carla.page.getByText('Compartilhando tela', { exact: true })).toBeVisible();
     await expectRemoteAudio(carla.page, 'AliceCall'); await expectRemoteAudio(bruno.page, 'AliceCall');
     await alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true }).click();
@@ -341,14 +382,33 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await expectRemoteAudio(carla.page, 'AliceCall');
     const disconnected = await alice.page.request.post('http://127.0.0.1:3355/__test/disconnect/AliceCall');
     expect(disconnected.ok()).toBe(true);
-    await expectStopped(alice.page);
-    await expect(alice.page.getByText('A conexão caiu. Entre novamente na chamada após reconectar.', { exact: true })).toBeVisible();
-    await expect(alice.page.getByRole('button', { name: 'Entrar na chamada', exact: true })).toBeEnabled();
-    await alice.page.getByRole('button', { name: 'Entrar na chamada', exact: true }).click();
+    await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toBeVisible();
     await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1);
-    await alice.page.getByRole('button', { name: 'Ativar microfone', exact: true }).click();
+    await expect(alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true })).toBeVisible();
     await expectRemoteAudio(carla.page, 'AliceCall');
+    await Promise.all([alice.page, carla.page].map(page => page.evaluate(() => {
+      (window as unknown as InstrumentedWindow).__peers.filter(peer => peer.connectionState === 'connected').forEach(peer => {
+        peer.close(); peer.dispatchEvent(new Event('connectionstatechange'));
+      });
+    })));
+    await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1);
+    await expect(alice.page.getByText('CarlaCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    await expect(carla.page.getByText('AliceCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    const simultaneous = await alice.page.request.post('http://127.0.0.1:3355/__test/disconnect-call', { data: { usernames: ['AliceCall', 'CarlaCall'] } });
+    expect(simultaneous.ok()).toBe(true); expect((await simultaneous.json() as { disconnected: number }).disconnected).toBe(2);
+    await expect(alice.page.getByText('Sua conexão caiu. Tentando reconectar…', { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(carla.page.getByText('Sua conexão caiu. Tentando reconectar…', { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toBeVisible();
+    await expect(carla.page.getByText('Conexão restabelecida.', { exact: true })).toBeVisible();
+    await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1);
+    await expect(alice.page.getByText('CarlaCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    await expect(carla.page.getByText('AliceCall saiu da chamada.', { exact: true })).toHaveCount(0);
+    await alice.page.reload();
+    await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toBeVisible({ timeout: 30_000 });
+    await expectConnectedPeers(alice.page, 1); await expectConnectedPeers(carla.page, 1);
     await alice.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
+    await expect(carla.page.getByText('AliceCall saiu da chamada.', { exact: true })).toBeVisible();
+    await expect(carla.page.getByText('Aguardando participantes', { exact: true })).toBeVisible();
     await carla.page.getByRole('button', { name: 'Encerrar chamada', exact: true }).click();
     await expectStopped(alice.page); await expectStopped(carla.page);
   } finally { await closeAll(contexts); }
@@ -407,11 +467,47 @@ test('layout móvel mantém login, marca, chat e anexos dentro da viewport', asy
     const attachment = page.getByRole('button', { name: /Visualizar imagem imagem-com-nome/ });
     await expect(attachment).toBeVisible();
     const imageBox = await attachment.locator('img').boundingBox();
-    const textBox = await attachment.locator('span').boundingBox();
+    const textBox = await attachment.locator(':scope > span:last-child').boundingBox();
     expect(imageBox && textBox && textBox.x >= imageBox.x + imageBox.width).toBe(true);
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
 
     const composer = await page.locator('.composer').boundingBox();
     expect(composer && composer.x >= 0 && composer.x + composer.width <= 320).toBe(true);
   } finally { await context.close(); }
+});
+
+test('imagens reais, lightbox, download, fallback e bloqueio antecipado de uploads', async ({ browser }) => {
+  const personA = await person(browser, `Images${Date.now()}`); const { page } = personA;
+  try {
+    await createRoom(page, 'Imagens');
+    for (const [extension, mimeType] of [['jpg', 'image/jpeg'], ['png', 'image/png'], ['webp', 'image/webp']]) {
+      const encoded = await page.evaluate(type => {
+        const canvas = document.createElement('canvas'); canvas.width = 32; canvas.height = 24;
+        canvas.getContext('2d')!.fillRect(0, 0, 32, 24); return canvas.toDataURL(type).split(',')[1];
+      }, mimeType);
+      const name = `preview.${extension}`;
+      await page.locator('.attach-button input').setInputFiles({ name, mimeType, buffer: Buffer.from(encoded, 'base64') });
+      await page.getByRole('button', { name: 'Enviar mensagem', exact: true }).click();
+      const button = page.getByRole('button', { name: `Visualizar imagem ${name}`, exact: true });
+      await expect.poll(() => button.locator('img').evaluateAll(images => images.some(image => (image as HTMLImageElement).naturalWidth === 32))).toBe(true);
+      await button.click();
+      await expect.poll(() => page.locator('.image-lightbox-stage img').evaluateAll(images => images.some(image => (image as HTMLImageElement).naturalWidth === 32))).toBe(true);
+      const downloaded = page.waitForEvent('download'); await page.getByRole('button', { name: 'Baixar imagem', exact: true }).click();
+      expect((await downloaded).suggestedFilename()).toBe(name);
+      await page.getByRole('button', { name: 'Fechar visualização' }).click();
+    }
+    let uploads = 0; page.on('request', request => { if (request.method() === 'POST' && request.url().endsWith('/attachments')) uploads++; });
+    for (const [name, mimeType, label] of [['large.mp4', 'video/mp4', 'O vídeo'], ['large.pdf', 'application/pdf', 'O arquivo']]) {
+      await page.locator('.attach-button input').setInputFiles({ name, mimeType, buffer: Buffer.alloc(4 * 1024 * 1024 + 1) });
+      await expect(page.getByRole('alert').filter({ hasText: label })).toContainText('4 MB');
+      await expect(page.getByRole('button', { name: 'Enviar mensagem', exact: true })).toBeDisabled();
+    }
+    expect(uploads).toBe(0);
+    await page.route('**/attachments/*/download', route => route.fulfill({ status: 503, body: 'unavailable' }));
+    await page.reload();
+    await expect(page.getByText('Imagem indisponível', { exact: true })).toHaveCount(3);
+    await page.getByRole('button', { name: 'Visualizar imagem preview.jpg', exact: true }).click();
+    await expect(page.locator('.image-lightbox').getByRole('alert')).toContainText('Não foi possível carregar');
+    await expect(page.getByRole('button', { name: 'Baixar imagem', exact: true })).toBeEnabled();
+  } finally { await personA.context.close(); }
 });

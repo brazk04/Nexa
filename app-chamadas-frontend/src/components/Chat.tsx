@@ -2,6 +2,7 @@ import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { FormEvent, KeyboardEvent as ReactKeyboardEvent } from 'react';
 import type { AttachmentInfo, Message, Room, TypingUser } from '../../../shared/protocol';
 import { api, authorizedFetch } from '../lib/api';
+import { UPLOAD_ACCEPT, validateUpload } from '../../../shared/uploads';
 import { Avatar } from './Avatar';
 import { Icon } from './Icon';
 
@@ -140,6 +141,8 @@ export function Chat({ room, messages, ready, userId, typingUsers, hasMore, load
     try {
       if (editing) await edit(editing.id, draft);
       else if (file) {
+        const invalid = validateUpload(file);
+        if (invalid) throw new Error(invalid);
         const form = new FormData();
         form.append('file', file); form.append('text', draft);
         if (reply) form.append('replyToId', String(reply.id));
@@ -210,7 +213,11 @@ export function Chat({ room, messages, ready, userId, typingUsers, hasMore, load
       {error && <p className="inline-error" role="alert">{error}</p>}
       {(reply || editing || file) && <div className="composer-context"><div><small>{editing ? 'Editando mensagem' : reply ? `Respondendo a @${reply.autor}` : 'Arquivo selecionado'}</small><span>{reply ? reply.texto : editing ? editing.texto : file?.name}</span></div><button type="button" aria-label="Cancelar contexto" onClick={() => { setReply(null); setEditing(null); setFile(null); if (editing) setDraft(''); }}><Icon name="close" size={16} /></button></div>}
       <div className="composer">
-        <label className="attach-button" data-tooltip="Anexar arquivo" aria-label="Anexar arquivo"><Icon name="paperclip" size={20} /><input hidden type="file" onChange={event => setFile(event.target.files?.[0] ?? null)} /></label>
+        <label className="attach-button" data-tooltip="Anexar arquivo — até 4 MB" aria-label="Anexar arquivo"><Icon name="paperclip" size={20} /><input hidden type="file" accept={UPLOAD_ACCEPT} onChange={event => {
+          const selected = event.target.files?.[0] ?? null;
+          const invalid = selected ? validateUpload(selected) : '';
+          setError(invalid); setFile(invalid ? null : selected); event.target.value = '';
+        }} /></label>
         <textarea aria-label={`Mensagem para ${room.name}`} ref={input} rows={1} maxLength={4000} value={draft} disabled={!ready || sending} onChange={event => setDraft(event.target.value)} onKeyDown={keyDown} placeholder={ready ? `Escreva em #${room.name}. Use @usuario para mencionar.` : 'Aguardando conexão…'} />
         <button aria-label="Enviar mensagem" className="send-button" type="submit" disabled={!ready || sending || (!draft.trim() && !file)}><Icon name="send" size={20} /></button>
       </div>
@@ -222,21 +229,23 @@ export function Chat({ room, messages, ready, userId, typingUsers, hasMore, load
 }
 
 function Attachment({ attachment, onPreview }: { attachment: AttachmentInfo; onPreview: (attachment: AttachmentInfo) => void }) {
+  const [error, setError] = useState('');
+  const download = () => { void downloadAttachment(attachment).catch(() => setError('Não foi possível baixar o arquivo. Tente novamente.')); };
   const isImage = attachment.mimeType.startsWith('image/');
   const icon = isImage ? 'image' : attachment.mimeType.includes('zip') || attachment.mimeType.includes('compressed') ? 'archive' : 'file';
-  if (isImage) return <button type="button" className="message-attachment is-image image-attachment-button" onClick={() => onPreview(attachment)} aria-label={'Visualizar imagem ' + attachment.name}>
+  if (isImage) return <div><button type="button" className="message-attachment is-image image-attachment-button" onClick={() => onPreview(attachment)} aria-label={'Visualizar imagem ' + attachment.name}>
     <AuthenticatedImage path={attachment.downloadUrl} /><span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)} · Abrir imagem</small></span>
-  </button>;
-  return <button type="button" className="message-attachment" onClick={() => void downloadAttachment(attachment)}>
+  </button><button type="button" onClick={download}>Baixar {attachment.name}</button>{error && <span role="alert">{error}</span>}</div>;
+  return <div><button type="button" className="message-attachment" onClick={download}>
     <span className="attachment-icon"><Icon name={icon} size={19} /></span>
     <span><strong>{attachment.name}</strong><small>{formatBytes(attachment.size)}</small></span>
-  </button>;
+  </button>{error && <span role="alert">{error}</span>}</div>;
 }
 
 function AuthenticatedImage({ path }: { path: string }) {
-  const image = useRef<HTMLImageElement>(null);
+  const image = useRef<HTMLSpanElement>(null);
   const [visible, setVisible] = useState(() => !('IntersectionObserver' in window));
-  const href = useAttachmentUrl(path, visible);
+  const { url: href, error, fail } = useAttachmentUrl(path, visible);
   useEffect(() => {
     const target = image.current;
     if (!target || visible) return;
@@ -245,11 +254,12 @@ function AuthenticatedImage({ path }: { path: string }) {
     }, { rootMargin: '300px' });
     observer.observe(target); return () => observer.disconnect();
   }, [visible]);
-  return <img ref={image} src={href || undefined} alt="" decoding="async" />;
+  return <span ref={image} className="attachment-preview">{error ? <span role="alert">Imagem indisponível</span> : href ? <img src={href} alt="" decoding="async" onError={fail} /> : <span role="status">Carregando…</span>}</span>;
 }
 
 function ImageLightbox({ attachment, onClose }: { attachment: AttachmentInfo; onClose: () => void }) {
-  const href = useAttachmentUrl(attachment.downloadUrl, true);
+  const { url: href, error, fail } = useAttachmentUrl(attachment.downloadUrl, true);
+  const [downloadError, setDownloadError] = useState('');
   useEffect(() => {
     const close = (event: KeyboardEvent) => { if (event.key === 'Escape') onClose(); };
     window.addEventListener('keydown', close);
@@ -258,32 +268,36 @@ function ImageLightbox({ attachment, onClose }: { attachment: AttachmentInfo; on
   return <div className="image-lightbox" role="presentation" onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}>
     <section className="image-lightbox-dialog" role="dialog" aria-modal="true" aria-label={'Visualização de ' + attachment.name}>
       <header><strong>{attachment.name}</strong><button type="button" aria-label="Fechar visualização" onClick={onClose}><Icon name="close" size={18} /></button></header>
-      <div className="image-lightbox-stage">{href ? <img src={href} alt={attachment.name} decoding="async" /> : <span role="status">Carregando imagem…</span>}</div>
-      <footer><span>{formatBytes(attachment.size)}</span><button type="button" className="primary-button" onClick={() => void downloadAttachment(attachment)}><Icon name="file" size={16} />Baixar imagem</button></footer>
+      <div className="image-lightbox-stage">{error ? <span role="alert">Não foi possível carregar a imagem. Você pode tentar baixá-la.</span> : href ? <img src={href} alt={attachment.name} decoding="async" onError={fail} /> : <span role="status">Carregando imagem…</span>}</div>
+      {downloadError && <p role="alert">{downloadError}</p>}
+      <footer><span>{formatBytes(attachment.size)}</span><button type="button" className="primary-button" onClick={() => void downloadAttachment(attachment).catch(() => setDownloadError('Não foi possível baixar a imagem. Tente novamente.'))}><Icon name="file" size={16} />Baixar imagem</button></footer>
     </section>
   </div>;
 }
 
 function useAttachmentUrl(path: string, enabled: boolean) {
   const [url, setUrl] = useState('');
+  const [error, setError] = useState(false);
+  const fail = useCallback(() => setError(true), []);
   useEffect(() => {
     if (!enabled) return;
     let active = true; let objectUrl = '';
-    void authorizedFetch(path).then(response => {
+    const abort = new AbortController();
+    void authorizedFetch(path, { signal: abort.signal }).then(response => {
       if (!response.ok) throw new Error('attachment-unavailable');
       return response.blob();
     }).then(blob => {
       if (!active) return;
       objectUrl = URL.createObjectURL(blob); setUrl(objectUrl);
-    }).catch(() => { if (active) setUrl(''); });
-    return () => { active = false; if (objectUrl) URL.revokeObjectURL(objectUrl); };
+    }).catch(() => { if (active) { setUrl(''); setError(true); } });
+    return () => { active = false; abort.abort(); if (objectUrl) URL.revokeObjectURL(objectUrl); };
   }, [enabled, path]);
-  return url;
+  return { url, error, fail };
 }
 
 async function downloadAttachment(attachment: AttachmentInfo) {
   const response = await authorizedFetch(attachment.downloadUrl);
-  if (!response.ok) return;
+  if (!response.ok) throw new Error('Download indisponível');
   const objectUrl = URL.createObjectURL(await response.blob());
   const link = document.createElement('a');
   link.href = objectUrl; link.download = attachment.name; link.rel = 'noreferrer';

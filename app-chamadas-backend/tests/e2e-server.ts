@@ -24,6 +24,12 @@ async function main() {
     for (const socket of io.sockets.sockets.values()) if (socket.data.username === request.params.username) socket.conn.close();
     response.status(204).end();
   });
+  app.post('/__test/disconnect-call', (request, response) => {
+    const usernames = Array.isArray(request.body?.usernames) ? new Set(request.body.usernames.filter((value: unknown): value is string => typeof value === 'string')) : new Set<string>();
+    const targets = [...io.sockets.sockets.values()].filter(socket => usernames.has(socket.data.username));
+    targets.forEach(socket => socket.conn.close());
+    response.json({ disconnected: targets.length });
+  });
   server.listen(3355, '127.0.0.1', () => console.log('Isolated browser test server: 3355'));
   let closing = false;
   const close = () => {

@@ -59,7 +59,7 @@ export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser
     const onDisconnect = () => {
       requestRef.current = '';
       setStatus(roomRef.current ? 'connecting' : 'idle'); setUsers([]); setTypingUsers([]);
-      setRoomCall({ sala: roomRef.current ?? '', callId: null, startedAt: null, participants: [] });
+      // Keep the last room snapshot while signaling reconnects.
     };
     const onError = (failure: Error) => {
       setStatus('error');
@@ -71,10 +71,19 @@ export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser
       setMessages(previous => mergeMessages(previous, history.mensagens.map(confirmed)));
       setHasMore(history.hasMore); setStatus('connected'); setError('');
     };
+    let readTimer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleRead = () => {
+      if (readTimer || !roomRef.current || document.visibilityState !== 'visible') return;
+      const sala = roomRef.current;
+      readTimer = setTimeout(() => {
+        readTimer = undefined;
+        if (socket.connected && roomRef.current === sala && document.visibilityState === 'visible') socket.emit('marcar_sala_lida', { sala });
+      }, 750);
+    };
     const onMessage = (message: Message) => {
       if (message.sala !== roomRef.current) return;
       setMessages(previous => mergeMessages(previous, [confirmed(message)]));
-      if (document.visibilityState === 'visible') socket.emit('marcar_sala_lida', { sala: message.sala });
+      scheduleRead();
     };
     const onMessageUpdated = (message: Message) => {
       if (message.sala === roomRef.current) setMessages(previous => previous.map(item => item.id === message.id ? { ...confirmed(message), mentioned: item.mentioned || message.mentioned } : item));
@@ -92,9 +101,12 @@ export function useRoom(socket: AppSocket, roomId: string | null, user: AuthUser
     socket.on('chamada_atualizada', onCall);
     socket.on('usuarios_digitando', onTyping);
     socket.on('erro_operacao', setError);
+    document.addEventListener('visibilitychange', scheduleRead);
     socket.connect();
     return () => {
       mounted.current = false; requestRef.current = '';
+      if (readTimer) clearTimeout(readTimer);
+      document.removeEventListener('visibilitychange', scheduleRead);
       socket.off('connect', join); socket.off('disconnect', onDisconnect); socket.off('connect_error', onError);
       socket.off('historico_mensagens', onHistory); socket.off('nova_mensagem', onMessage); socket.off('mensagem_atualizada', onMessageUpdated);
       socket.off('usuarios_online', onPresence); socket.off('chamada_atualizada', onCall); socket.off('usuarios_digitando', onTyping); socket.off('erro_operacao', setError);

@@ -24,6 +24,6 @@ export async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   if (response.status === 204) return undefined as T;
   const data = await response.json().catch(() => ({})) as { error?: string; code?: string } & T;
-  if (!response.ok) throw new ApiError(data.error || 'Não foi possível concluir a operação.', response.status, data.code);
+  if (!response.ok) throw new ApiError(data.error || (response.status === 413 ? 'O arquivo excede o limite permitido de 4 MB.' : 'Não foi possível concluir a operação.'), response.status, data.code);
   return data;
 }

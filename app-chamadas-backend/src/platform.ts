@@ -20,6 +20,7 @@ import { createVerificationSender } from './email';
 import type { VerificationSender } from './email';
 
 import type { PresenceStatus } from '../shared/protocol';
+import { MAX_UPLOAD_BYTES, uploadSizeError, validateUpload } from '../shared/uploads';
 
 interface SocketData {
   sala?: string;
@@ -35,6 +36,7 @@ interface SocketData {
   typing?: boolean;
   call?: {
     id: string;
+    roomId: string;
     startedAt: string;
     attemptId: string;
     microphone: boolean;
@@ -48,12 +50,13 @@ interface RealtimeInfrastructure {
   initialize: (io: Server) => Promise<void>;
   withLock: <T>(key: string, task: () => Promise<T>) => Promise<T>;
 }
-interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string; realtime?: RealtimeInfrastructure }
+interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string; realtime?: RealtimeInfrastructure; callRecoveryGraceMs?: number }
 const MAX_CALL_PARTICIPANTS = 15;
 const VERIFY_DURATION_MS = 60 * 60 * 1000;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 100;
 const channelKey = (roomId: string) => `channel:${roomId}`;
+const callKey = (roomId: string) => `call:${roomId}`;
 const presenceKey = (roomId: string) => `presence:${roomId}`;
 const userKey = (userId: string) => `user:${userId}`;
 const normalize = (value: string) => value.normalize('NFC').toLocaleLowerCase('pt-BR');
@@ -145,6 +148,8 @@ function imageExtension(buffer: Buffer) {
 function safeAttachment(file: Express.Multer.File) {
   const extension = extname(file.originalname).toLocaleLowerCase('en-US');
   const image = imageExtension(file.buffer);
+  if (extension === '.mp4' && file.buffer.length >= 12 && file.buffer.toString('ascii', 4, 8) === 'ftyp') return { extension, mimeType: 'video/mp4' };
+  if (extension === '.webm' && file.buffer.subarray(0, 4).equals(Buffer.from([0x1a, 0x45, 0xdf, 0xa3])) && file.buffer.subarray(0, 512).includes(Buffer.from('webm'))) return { extension, mimeType: 'video/webm' };
   if (image && ['.png', '.jpg', '.jpeg', '.webp', '.gif'].includes(extension)) return { extension: image, mimeType: image === '.jpg' ? 'image/jpeg' : `image/${image.slice(1)}` };
   if (extension === '.pdf' && file.buffer.toString('ascii', 0, 5) === '%PDF-') return { extension, mimeType: 'application/pdf' };
   if (['.zip', '.docx', '.xlsx', '.pptx'].includes(extension) && file.buffer[0] === 0x50 && file.buffer[1] === 0x4b) return { extension, mimeType: file.mimetype };
@@ -158,7 +163,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   const backgroundTasks = new Set<Promise<unknown>>();
   const track = <T>(task: Promise<T>) => {
     backgroundTasks.add(task);
-    void task.finally(() => backgroundTasks.delete(task));
+    void task.then(() => backgroundTasks.delete(task), () => backgroundTasks.delete(task));
     return task;
   };
   const whenIdle = async () => {
@@ -176,6 +181,10 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     finally { release(); if (localLockTails.get(key) === tail) localLockTails.delete(key); }
   };
   const withRealtimeLock = options.realtime?.withLock ?? localLock;
+  const callRecoveryGraceMs = options.callRecoveryGraceMs ?? 30_000;
+  const callTrace = (event: string, fields: Record<string, unknown>) => {
+    if (process.env.NODE_ENV !== 'production') console.info(JSON.stringify({ scope: 'nexa-call', event, ...fields }));
+  };
   const storageRoot = resolve(options.storageRoot || process.env.UPLOAD_DIR || join(process.cwd(), 'storage'));
   const avatarDirectory = join(storageRoot, 'avatars');
   const fileDirectory = join(storageRoot, 'files');
@@ -188,6 +197,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   const isBlobReference = (value: string) => /^https:\/\/[^/]+\.blob\.vercel-storage\.com\//u.test(value);
   const storeAttachment = async (storedName: string, contents: Buffer, mimeType: string) => {
     if (!blobEnabled) {
+      if (process.env.VERCEL) throw new Error('Blob não configurado para produção');
       await writeFile(join(fileDirectory, storedName), contents, { flag: 'wx' });
       return storedName;
     }
@@ -201,6 +211,12 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     else await unlink(join(fileDirectory, basename(storedName)));
   };
   const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024, files: 1 } });
+  const attachmentUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: MAX_UPLOAD_BYTES, files: 1, fields: 3, fieldSize: 16_384 },
+    fileFilter: (request, file, done) => {
+      (request as express.Request & { uploadFile?: { name: string; type: string } }).uploadFile = { name: file.originalname, type: file.mimetype };
+      done(null, true);
+    },
+  });
   const configuredOrigins = process.env.CORS_ORIGIN?.split(',').map(origin => origin.trim()).filter(Boolean);
   const allowedOrigins: string[] | true = configuredOrigins?.length ? configuredOrigins : true;
   app.disable('x-powered-by');
@@ -723,9 +739,12 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   const io = new Server<ClientEvents, ServerEvents, Record<string, never>, SocketData>(server, {
     cors: { origin: allowedOrigins, credentials: true }, maxHttpBufferSize: 256_000,
     pingInterval: 10_000, pingTimeout: 10_000,
-    connectionStateRecovery: { maxDisconnectionDuration: 2 * 60_000, skipMiddlewares: false },
+    connectionStateRecovery: { maxDisconnectionDuration: callRecoveryGraceMs, skipMiddlewares: false },
   });
   const realtimeReady = options.realtime?.initialize(io as Server) ?? Promise.resolve();
+  const recoveryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const recoveryKey = (sala: string, callId: string, userId: string, attemptId: string) => `${sala}:${callId}:${userId}:${attemptId}`;
+  server.once('close', () => { for (const timer of recoveryTimers.values()) clearTimeout(timer); recoveryTimers.clear(); });
   io.use(async (socket, next) => {
     try {
       await realtimeReady;
@@ -745,7 +764,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const memberships = await prisma.roomMember.findMany({ where: { userId: auth.user.id }, select: { roomId: true } });
       for (const membership of memberships) await socket.join(presenceKey(membership.roomId));
       next();
-    } catch { next(new Error('unauthorized')); }
+    } catch { next(new Error('Serviço de conexão temporariamente indisponível. Tentando reconectar…')); }
   });
 
   const participant = (client: { id: string; data: SocketData }): CallParticipant | null => client.data.call ? {
@@ -755,11 +774,23 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     attemptId: client.data.call.attemptId, handRaisedAt: client.data.call.handRaisedAt,
   } : null;
   async function snapshot(sala: string): Promise<RoomCall> {
-    const clients = await io.in(channelKey(sala)).fetchSockets();
+    const clients = await io.in(callKey(sala)).fetchSockets();
     const active = clients.map(client => ({ client, participant: participant(client) }))
-      .filter((entry): entry is { client: typeof clients[number]; participant: CallParticipant } => Boolean(entry.participant && entry.client.data.sala === sala));
+      .filter((entry): entry is { client: typeof clients[number]; participant: CallParticipant } => Boolean(entry.participant && entry.client.data.call?.roomId === sala));
     const first = active[0]?.client.data.call;
-    return { sala, callId: first?.id ?? null, startedAt: first?.startedAt ?? null, participants: active.filter(entry => entry.client.data.call?.id === first?.id).map(entry => entry.participant) };
+    const participants = active.filter(entry => entry.client.data.call?.id === first?.id).map(entry => entry.participant);
+    const users = participants.length ? await prisma.user.findMany({
+      where: { id: { in: [...new Set(participants.map(item => item.userId))] } },
+      select: { id: true, username: true, displayName: true, avatarPath: true, updatedAt: true },
+    }) : [];
+    const currentUsers = new Map(users.map(user => [user.id, user]));
+    return {
+      sala, callId: first?.id ?? null, startedAt: first?.startedAt ?? null,
+      participants: participants.map(item => {
+        const user = currentUsers.get(item.userId);
+        return user ? { ...item, username: user.username, displayName: user.displayName || user.username, avatarUrl: avatarUrl(user) } : item;
+      }),
+    };
   }
   async function presence(sala: string) {
     const clients = await io.in(presenceKey(sala)).fetchSockets();
@@ -767,16 +798,24 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     for (const client of clients) {
       if (!client.data.userId) continue;
       const previous = unique.get(client.data.userId);
-      const inCall = client.data.sala === sala && Boolean(client.data.call);
+      const inCall = client.data.call?.roomId === sala;
       if (!previous || inCall) unique.set(client.data.userId, {
         userId: client.data.userId, socketId: client.id, username: client.data.username, displayName: client.data.displayName,
         avatarUrl: client.data.avatarUrl, status: client.data.status, inCall: inCall || previous?.inCall || false,
       });
     }
+    const users = unique.size ? await prisma.user.findMany({
+      where: { id: { in: [...unique.keys()] } },
+      select: { id: true, username: true, displayName: true, avatarPath: true, updatedAt: true },
+    }) : [];
+    for (const user of users) {
+      const current = unique.get(user.id); if (!current) continue;
+      unique.set(user.id, { ...current, username: user.username, displayName: user.displayName || user.username, avatarUrl: avatarUrl(user) });
+    }
     io.to(presenceKey(sala)).emit('usuarios_online', { sala, users: [...unique.values()] });
   }
   async function broadcastCall(sala: string) {
-    io.to(channelKey(sala)).emit('chamada_atualizada', await snapshot(sala));
+    io.to(channelKey(sala)).to(callKey(sala)).emit('chamada_atualizada', await snapshot(sala));
     await presence(sala);
   }
   async function broadcastTyping(sala: string) {
@@ -791,14 +830,18 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     socket.data.typing = false; void broadcastTyping(sala);
   }
   async function leaveCall(socket: ClientSocket, reason: CallLeft['reason']) {
-    const sala = socket.data.sala;
     const call = socket.data.call;
+    const sala = call?.roomId;
     const leaving = participant(socket);
     if (!sala || !call || !leaving) return;
+    const key = recoveryKey(sala, call.id, leaving.userId, call.attemptId);
+    const timer = recoveryTimers.get(key); if (timer) clearTimeout(timer); recoveryTimers.delete(key);
+    callTrace('leave-confirmed', { socketId: socket.id, roomId: sala, callId: call.id, reason });
     socket.data.call = undefined;
+    await socket.leave(callKey(sala));
     await prisma.callAttendance.updateMany({ where: { callId: call.id, userId: leaving.userId, leftAt: null }, data: { leftAt: new Date() } }).catch(() => undefined);
-    socket.to(channelKey(sala)).emit('participante_saiu', {
-      sala, callId: call.id, socketId: socket.id, username: leaving.username, reason,
+    socket.to(channelKey(sala)).to(callKey(sala)).emit('participante_saiu', {
+      sala, callId: call.id, socketId: socket.id, username: leaving.displayName, reason,
     });
     await broadcastCall(sala);
     await withRealtimeLock(`call:${sala}`, async () => {
@@ -808,15 +851,43 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       }
     }).catch(() => undefined);
   }
+  function scheduleDisconnectedCall(socket: ClientSocket, transportReason: string) {
+    if (transportReason === 'server shutting down') return;
+    const call = socket.data.call; const sala = call?.roomId; const leaving = participant(socket);
+    if (!sala || !call || !leaving) return;
+    const key = recoveryKey(sala, call.id, leaving.userId, call.attemptId);
+    if (recoveryTimers.has(key)) return;
+    callTrace('recovery-window-started', { socketId: socket.id, roomId: sala, callId: call.id, reason: transportReason, graceMs: callRecoveryGraceMs });
+    socket.to(channelKey(sala)).to(callKey(sala)).emit('conexao_participante', {
+      sala, callId: call.id, socketId: socket.id, userId: leaving.userId, username: leaving.displayName, status: 'reconnecting',
+    });
+    const timer = setTimeout(() => {
+      recoveryTimers.delete(key);
+      track(withRealtimeLock(`call:${sala}`, async () => {
+        const clients = await io.in(callKey(sala)).fetchSockets();
+        const restored = clients.some(client => client.data.userId === leaving.userId && client.data.call?.id === call.id && client.data.call.roomId === sala);
+        if (restored) { callTrace('recovery-confirmed', { socketId: socket.id, roomId: sala, callId: call.id }); return; }
+        const attendance = await prisma.callAttendance.findUnique({ where: { callId_userId: { callId: call.id, userId: leaving.userId } }, select: { leftAt: true } });
+        if (attendance?.leftAt) { callTrace('recovery-cleanup-cancelled', { socketId: socket.id, roomId: sala, callId: call.id, reason: 'already-left' }); return; }
+        callTrace('recovery-timeout', { socketId: socket.id, roomId: sala, callId: call.id, reason: transportReason });
+        await prisma.callAttendance.updateMany({ where: { callId: call.id, userId: leaving.userId, leftAt: null }, data: { leftAt: new Date() } }).catch(() => undefined);
+        io.to(channelKey(sala)).to(callKey(sala)).emit('participante_saiu', { sala, callId: call.id, socketId: socket.id, username: leaving.displayName, reason: 'timeout' });
+        const current = await snapshot(sala);
+        io.to(channelKey(sala)).to(callKey(sala)).emit('chamada_atualizada', current); await presence(sala);
+        if (current.callId !== call.id) await prisma.callHistory.updateMany({ where: { id: call.id, endedAt: null }, data: { endedAt: new Date() } });
+      }).catch(error => callTrace('recovery-timeout-error', { socketId: socket.id, roomId: sala, callId: call.id, error: error instanceof Error ? error.name : 'UnknownError' })));
+    }, callRecoveryGraceMs);
+    timer.unref?.(); recoveryTimers.set(key, timer);
+  }
   function reject(socket: ClientSocket, ack: unknown, error: string, code?: string) {
     if (typeof ack === 'function') (ack as Ack)({ ok: false, error, code });
     else socket.emit('erro_operacao', error);
   }
   function signalTarget(socket: ClientSocket, data: unknown) {
-    if (!isRecord(data) || !validId(data.to) || !validId(data.callId) || data.sala !== socket.data.sala) return null;
+    if (!isRecord(data) || !validId(data.to) || !validId(data.callId)) return null;
     const call = socket.data.call;
-    if (socket.data.joining || !call || call.id !== data.callId || data.to === socket.id) return null;
-    return { to: data.to, sala: socket.data.sala!, callId: call.id, from: socket.id };
+    if (!call || data.sala !== call.roomId || call.id !== data.callId || data.to === socket.id) return null;
+    return { to: data.to, sala: call.roomId, callId: call.id, from: socket.id };
   }
   async function mentionIds(roomId: string, text: string) {
     const names = [...text.matchAll(/@([\p{L}\p{N}_.-]{3,32})/gu)].map(match => normalize(match[1]!));
@@ -853,11 +924,13 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   }
 
   async function removeClientFromRoom(socket: ClientSocket, roomId: string) {
-    if (socket.data.sala !== roomId) return;
-    await leaveCall(socket, 'room-change'); stopTyping(socket, roomId);
-    await socket.leave(channelKey(roomId));
+    if (socket.data.call?.roomId === roomId) await leaveCall(socket, 'room-change');
+    if (socket.data.sala === roomId) {
+      stopTyping(socket, roomId);
+      await socket.leave(channelKey(roomId));
+      socket.data.sala = undefined; socket.data.joining = false; socket.data.revision += 1;
+    }
     await socket.leave(presenceKey(roomId));
-    socket.data.sala = undefined; socket.data.joining = false; socket.data.revision += 1;
   }
 
   app.delete('/rooms/:id', requireAuth, async (request, response) => {
@@ -875,7 +948,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       response.status(403).json({ error: 'Você não tem acesso a esta sala.' }); return;
     }
     if (room.createdById === userId) {
-      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.sala === roomId);
+      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.sala === roomId || socket.data.call?.roomId === roomId);
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
       await Promise.all([...io.sockets.sockets.values()].filter(socket => room.members.some(member => member.userId === socket.data.userId)).map(socket => socket.leave(presenceKey(roomId))));
       await prisma.room.delete({ where: { id: roomId } });
@@ -883,7 +956,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       for (const member of room.members) io.to(userKey(member.userId)).emit('sala_removida', { roomId, reason: 'deleted' });
     } else {
       await prisma.roomMember.delete({ where: { userId_roomId: { userId, roomId } } });
-      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId && socket.data.sala === roomId);
+      const connected = [...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId && (socket.data.sala === roomId || socket.data.call?.roomId === roomId));
       await Promise.all(connected.map(socket => removeClientFromRoom(socket, roomId)));
       await Promise.all([...io.sockets.sockets.values()].filter(socket => socket.data.userId === userId).map(socket => socket.leave(presenceKey(roomId))));
       io.to(userKey(userId)).emit('sala_removida', { roomId, reason: 'left' });
@@ -892,15 +965,19 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     response.status(204).end();
   });
 
-  app.post('/rooms/:id/attachments', requireAuth, upload.single('file'), async (request, response) => {
+  app.post('/rooms/:id/attachments', requireAuth, attachmentUpload.single('file'), async (request, response) => {
     const roomId = routeId(request.params.id);
     const member = await memberFor(request, roomId);
     const file = request.file;
+    if (file) {
+      const invalid = validateUpload({ name: file.originalname, type: file.mimetype, size: file.size });
+      if (invalid) { response.status(file.size > MAX_UPLOAD_BYTES ? 413 : 400).json({ error: invalid }); return; }
+    }
     const accepted = file ? safeAttachment(file) : null;
     const text = typeof request.body?.text === 'string' ? request.body.text.trim() : '';
     const replyToId = Number.isInteger(Number(request.body?.replyToId)) && Number(request.body.replyToId) > 0 ? Number(request.body.replyToId) : null;
     if (!member) { response.status(403).json({ error: 'Você não tem acesso a esta sala.' }); return; }
-    if (!file || !accepted) { response.status(400).json({ error: 'Tipo de arquivo não permitido. Use imagem, PDF, documento, planilha, apresentação, ZIP, TXT ou CSV.' }); return; }
+    if (!file || !accepted) { response.status(400).json({ error: 'Conteúdo ou formato inválido. Use imagem, documento, MP4 ou WebM.' }); return; }
     if (text.length > 4000) { response.status(400).json({ error: 'A legenda deve ter até 4.000 caracteres.' }); return; }
     if (replyToId && !await prisma.mensagem.findFirst({ where: { id: replyToId, roomId } })) { response.status(400).json({ error: 'A mensagem respondida não existe nesta sala.' }); return; }
     const requestedName = `${randomUUID()}${accepted.extension}`;
@@ -919,8 +996,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         attachments: { create: { name: safeName(file.originalname), mimeType: accepted.mimeType, size: file.size, storedName } },
       }, include: messageInclude });
       io.to(channelKey(roomId)).emit('nova_mensagem', formatMessage(created));
-      await notifyMessage(created, getAuth(request).user.id);
       response.status(201).json({ message: formatMessage(created, getAuth(request).user.id) });
+      track(notifyMessage(created, getAuth(request).user.id).catch(() => undefined));
     } catch (error) {
       await removeAttachment(storedName).catch(() => undefined);
       console.error('Falha ao salvar anexo:', error instanceof Error ? error.message : 'erro desconhecido');
@@ -942,16 +1019,32 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         response.setHeader('ETag', result.blob.etag);
         if (result.statusCode === 304) { response.status(304).end(); return; }
         response.setHeader('Content-Length', String(result.blob.size ?? attachment.size));
-        Readable.fromWeb(result.stream as never).pipe(response);
+        const stream = Readable.fromWeb(result.stream as never);
+        stream.on('error', () => response.destroy());
+        response.on('close', () => stream.destroy());
+        stream.pipe(response);
       } else {
         const contents = await readFile(join(fileDirectory, basename(attachment.storedName)));
         response.setHeader('Content-Length', String(attachment.size));
         response.send(contents);
       }
-    } catch { response.status(404).end(); }
+    } catch (error) {
+      const missing = (error as { code?: string }).code === 'ENOENT';
+      response.status(missing ? 404 : 503).json({ error: missing ? 'Arquivo não encontrado. Solicite o reenvio.' : 'Não foi possível acessar o arquivo. Tente novamente.' });
+    }
   });
 
   io.on('connection', socket => {
+    if (socket.recovered && socket.data.call) {
+      const { call } = socket.data; const sala = call.roomId;
+      const key = recoveryKey(sala, call.id, socket.data.userId, call.attemptId);
+      const timer = recoveryTimers.get(key); if (timer) clearTimeout(timer); recoveryTimers.delete(key);
+      callTrace('socket-recovered', { socketId: socket.id, roomId: sala, callId: call.id });
+      socket.to(channelKey(sala)).to(callKey(sala)).emit('conexao_participante', {
+        sala, callId: call.id, socketId: socket.id, userId: socket.data.userId, username: socket.data.displayName, status: 'connected',
+      });
+      void broadcastCall(sala);
+    }
     socket.data.revision = 0;
     socket.data.joining = false;
     void socket.join(userKey(socket.data.userId));
@@ -976,7 +1069,7 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const previousRoom = socket.data.sala;
       const revision = ++socket.data.revision;
       socket.data.joining = true;
-      await leaveCall(socket, 'room-change'); stopTyping(socket, previousRoom);
+      stopTyping(socket, previousRoom);
       if (previousRoom) await socket.leave(channelKey(previousRoom));
       socket.data.sala = sala;
       await socket.join(channelKey(sala));
@@ -1009,14 +1102,8 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       if (!member) { reject(socket, ack, 'Você não tem acesso a esta sala.'); return; }
       try {
         const clientMessageId = typeof data.clientMessageId === 'string' ? data.clientMessageId : null;
-        if (clientMessageId) {
-          const existing = await prisma.mensagem.findUnique({ where: { clientMessageId }, include: messageInclude });
-          if (existing) {
-            if (existing.roomId !== sala || existing.userId !== socket.data.userId) { reject(socket, ack, 'Identificador de mensagem inválido.'); return; }
-            if (typeof ack === 'function') ack({ ok: true, data: formatMessage(existing, socket.data.userId) });
-            return;
-          }
-        }
+        // The unique constraint handles retries atomically in the P2002 path.
+        // New messages need no preliminary lookup by clientMessageId.
         const replyToId = Number.isInteger(data.replyToId) && Number(data.replyToId) > 0 ? Number(data.replyToId) : null;
         if (replyToId && !await prisma.mensagem.findFirst({ where: { id: replyToId, roomId: sala } })) { reject(socket, ack, 'A mensagem respondida não existe nesta sala.'); return; }
         const text = data.texto.trim();
@@ -1077,15 +1164,20 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     });
 
     socket.on('entrar_chamada', async (data: unknown, ack) => {
-      if (!isRecord(data) || !socket.data.sala || socket.data.joining || data.sala !== socket.data.sala || !validId(data.attemptId)) {
-        reject(socket, ack, 'Entre na sala antes de iniciar a chamada.'); return;
+      if (!isRecord(data) || !validId(data.sala) || !validId(data.attemptId)) {
+        reject(socket, ack, 'Informe uma sala válida para entrar na chamada.'); return;
       }
-      const sala = socket.data.sala;
+      const sala = data.sala;
       const member = await prisma.roomMember.findUnique({ where: { userId_roomId: { userId: socket.data.userId, roomId: sala } } });
       if (!member) { reject(socket, ack, 'Você não tem acesso a esta sala.'); return; }
       try {
-        const joined = await withRealtimeLock(`call:${sala}`, async () => {
+        const joined = await withRealtimeLock(`call-user:${socket.data.userId}`, () => withRealtimeLock(`call:${sala}`, async () => {
           const current = await snapshot(sala);
+          const ownCall = socket.data.call;
+          if (ownCall && ownCall.attemptId === data.attemptId && ownCall.roomId === sala) return { call: current, isNewCall: false };
+          const connected = await io.fetchSockets();
+          const existing = connected.find(client => client.id !== socket.id && client.data.userId === socket.data.userId && client.data.call);
+          if (ownCall || existing?.data.call) throw new Error('already-in-other-call');
           if (current.participants.some(item => item.userId === socket.data.userId)) throw new Error('already-in-call');
           if (current.participants.length >= MAX_CALL_PARTICIPANTS) throw new Error('call-full');
           const isNewCall = !current.callId;
@@ -1100,46 +1192,64 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
             create: { callId, userId: socket.data.userId },
             update: { joinedAt: new Date(), leftAt: null },
           });
+          await socket.join(callKey(sala));
           socket.data.call = {
-            id: callId, startedAt, attemptId: String(data.attemptId),
+            id: callId, roomId: sala, startedAt, attemptId: String(data.attemptId),
             microphone: false, camera: false, screen: false, handRaisedAt: null,
           };
+          const recovery = recoveryKey(sala, callId, socket.data.userId, String(data.attemptId));
+          const recoveryTimer = recoveryTimers.get(recovery);
+          if (recoveryTimer) {
+            clearTimeout(recoveryTimer); recoveryTimers.delete(recovery);
+            socket.to(channelKey(sala)).to(callKey(sala)).emit('conexao_participante', {
+              sala, callId, socketId: socket.id, userId: socket.data.userId, username: socket.data.displayName, status: 'connected',
+            });
+          }
           return { call: await snapshot(sala), isNewCall };
-        });
+        }));
         if (typeof ack === 'function') ack({ ok: true, data: joined.call });
         void broadcastCall(sala);
         if (joined.isNewCall) void notifyCall(sala, joined.call.callId!, socket.data.userId, socket.data.displayName);
       } catch (error) {
         if (error instanceof Error && error.message === 'already-in-call') { reject(socket, ack, 'Você já está nesta chamada.'); return; }
+        if (error instanceof Error && error.message === 'already-in-other-call') { reject(socket, ack, 'Você já está em uma chamada em outra sala. Saia da chamada atual antes de entrar em outra.', 'ALREADY_IN_CALL'); return; }
         if (error instanceof Error && error.message === 'call-full') { reject(socket, ack, 'A chamada atingiu o limite de 15 participantes.', 'CALL_FULL'); return; }
         reject(socket, ack, 'Não foi possível registrar a chamada. Tente novamente.');
       }
     });
     socket.on('sair_chamada', (data: unknown) => {
-      if (!isRecord(data) || data.sala !== socket.data.sala) return;
-      if (socket.data.call?.attemptId === data.attemptId) void leaveCall(socket, 'left');
+      const call = socket.data.call;
+      if (!isRecord(data) || !call || data.sala !== call.roomId) return;
+      if (call && call.attemptId === data.attemptId) {
+        callTrace('manual-leave-received', { socketId: socket.id, roomId: call.roomId, callId: call.id });
+        void leaveCall(socket, 'manual');
+      }
+    });
+    socket.on('sincronizar_chamada', async (data: unknown, ack) => {
+      const call = socket.data.call;
+      if (!isRecord(data) || !call || data.sala !== call.roomId || data.attemptId !== call.attemptId) { reject(socket, ack, 'Não foi possível sincronizar esta chamada.'); return; }
+      const sala = call.roomId;
+      callTrace('snapshot-requested', { socketId: socket.id, roomId: sala, callId: call.id });
+      if (typeof ack === 'function') ack({ ok: true, data: await snapshot(sala) });
     });
     socket.on('atualizar_midia', (data: unknown) => {
-      if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.microphone !== 'boolean' || typeof data.camera !== 'boolean' || typeof data.screen !== 'boolean') return;
       const call = socket.data.call;
-      if (!call || call.attemptId !== data.attemptId) return;
+      if (!isRecord(data) || !call || data.sala !== call.roomId || typeof data.microphone !== 'boolean' || typeof data.camera !== 'boolean' || typeof data.screen !== 'boolean' || call.attemptId !== data.attemptId) return;
       Object.assign(call, { microphone: data.microphone, camera: data.camera, screen: data.screen });
-      void broadcastCall(socket.data.sala!);
+      void broadcastCall(call.roomId);
     });
     socket.on('atualizar_mao', (data: unknown) => {
-      if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.raised !== 'boolean') return;
       const call = socket.data.call;
-      if (!call || call.attemptId !== data.attemptId) return;
+      if (!isRecord(data) || !call || data.sala !== call.roomId || typeof data.raised !== 'boolean' || call.attemptId !== data.attemptId) return;
       call.handRaisedAt = data.raised ? new Date().toISOString() : null;
-      void broadcastCall(socket.data.sala!);
+      void broadcastCall(call.roomId);
     });
     socket.on('enviar_reacao', (data: unknown) => {
       const allowed = new Set(['👍', '👏', '❤️', '😂', '🎉', '🤔']);
-      if (!isRecord(data) || data.sala !== socket.data.sala || typeof data.emoji !== 'string' || !allowed.has(data.emoji)) return;
       const call = socket.data.call;
-      if (!call || call.attemptId !== data.attemptId) return;
-      io.to(channelKey(socket.data.sala!)).emit('reacao_chamada', {
-        id: randomUUID(), sala: socket.data.sala!, callId: call.id, userId: socket.data.userId,
+      if (!isRecord(data) || !call || data.sala !== call.roomId || typeof data.emoji !== 'string' || !allowed.has(data.emoji) || call.attemptId !== data.attemptId) return;
+      io.to(callKey(call.roomId)).emit('reacao_chamada', {
+        id: randomUUID(), sala: call.roomId, callId: call.id, userId: socket.data.userId,
         username: socket.data.username, displayName: socket.data.displayName, emoji: data.emoji, createdAt: new Date().toISOString(),
       });
     });
@@ -1154,13 +1264,12 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
       const user = await prisma.user.findUnique({ where: { id: socket.data.userId } });
       if (!user) return;
       const displayName = user.displayName || user.username; const picture = avatarUrl(user);
-      const affectedRooms = new Set<string>();
       for (const client of io.sockets.sockets.values()) {
         if (client.data.userId !== user.id) continue;
         client.data.displayName = displayName; client.data.avatarUrl = picture;
-        for (const room of client.rooms) if (room.startsWith('presence:')) affectedRooms.add(room.slice('presence:'.length));
       }
-      for (const roomId of affectedRooms) { void broadcastCall(roomId); void presence(roomId); }
+      const memberships = await prisma.roomMember.findMany({ where: { userId: user.id }, select: { roomId: true } });
+      for (const membership of memberships) void broadcastCall(membership.roomId);
     });
     socket.on('webrtc_offer', (data: unknown) => {
       const target = signalTarget(socket, data);
@@ -1186,13 +1295,15 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
         usernameFragment: candidate.usernameFragment as string | null ?? null,
       } });
     });
-    socket.on('disconnecting', () => { track(leaveCall(socket, 'disconnected')); stopTyping(socket); });
+    socket.on('disconnecting', reason => { scheduleDisconnectedCall(socket, reason); stopTyping(socket); });
     socket.on('disconnecting', () => {
       const affectedPresence = [...socket.rooms].filter(room => room.startsWith('presence:')).map(room => room.slice('presence:'.length));
       setTimeout(() => { for (const roomId of affectedPresence) void presence(roomId); }, 0);
     });
   });
   app.use((error: unknown, _request: express.Request, response: express.Response, next: express.NextFunction) => {
+    const file = (_request as express.Request & { uploadFile?: { name: string; type: string } }).uploadFile;
+    if (file && error instanceof multer.MulterError && error.code === 'LIMIT_FILE_SIZE') { response.status(413).json({ error: uploadSizeError(file) }); return; }
     if (error instanceof multer.MulterError) { response.status(400).json({ error: error.code === 'LIMIT_FILE_SIZE' ? 'O arquivo deve ter no máximo 10 MB.' : 'Não foi possível processar o arquivo.' }); return; }
     next(error);
   });

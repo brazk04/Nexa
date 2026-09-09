@@ -64,7 +64,7 @@ As migrations `20260906120000_accounts_and_user_rooms` e `20260906183929_collabo
 - Aparência, densidade, tamanho da fonte, redução de movimento, destaque, notificações, status e dispositivos de mídia são persistidos por usuário. O tema de sistema acompanha mudanças do sistema operacional.
 - A seleção de câmera, microfone e saída de áudio usa `enumerateDevices()`, acompanha `devicechange`, oferece preview e medidor local do microfone e aplica `setSinkId()` quando suportado.
 - Favoritos, notificações por sala, não lidas e menções são individuais. O modo não perturbe bloqueia notificações de mensagem, menção e chamada sem interromper o chat.
-- O chat possui replies, edição e exclusão pelo autor, busca no banco, menções destacadas e anexos corporativos de até 10 MB. Downloads exigem autenticação e associação à sala; excluir uma mensagem também invalida e remove seus anexos.
+- O chat possui replies, edição e exclusão pelo autor, busca no banco, menções destacadas e anexos de até 4 MB (imagens, documentos e vídeos MP4/WebM). Downloads exigem autenticação e associação à sala; excluir uma mensagem também invalida e remove seus anexos.
 - Convites funcionam por `/join/CODIGO`, preservam o destino durante autenticação e possuem QR Code gerado pelo backend.
 - A central da reunião mantém agenda, itens resolvidos de forma assíncrona, decisões, tarefas simples e histórico de chamadas sem gravação de mídia.
 

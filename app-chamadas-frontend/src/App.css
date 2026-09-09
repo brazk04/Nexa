@@ -113,6 +113,8 @@ h1, h2, .primary-button, .workspace-brand strong { font-family: Sora, sans-serif
 .feedback { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 8px 28px; background: #8b5cf60e; border-bottom: 1px solid #8b5cf624; color: #ddcef8; font-size: 13px; }
 .feedback > button:not(.icon-button) { padding: 7px 10px; border-radius: 7px; border: 1px solid currentColor; background: transparent; }
 .feedback-error { background: #ef444412; color: #ffc1c1; border-color: #ef444429; }
+.feedback-warning { background: #f59e0b12; color: #fcd58d; border-color: #f59e0b35; }
+.feedback-success { background: #22c55e12; color: #9be9b5; border-color: #22c55e35; }
 .call-banner { display: flex; align-items: center; gap: 12px; padding: 13px 30px; background: #8b5cf611; border-bottom: 1px solid #8b5cf62a; }
 .call-banner p { flex: 1; font-size: 13px; }
 .call-banner > span:last-child { font-size: 11px; color: var(--muted); white-space: nowrap; }
@@ -483,6 +485,8 @@ button, input, textarea, select { transition: border-color .16s ease, background
 .header-tool.is-active { color: var(--warning); border-color: color-mix(in srgb,var(--warning) 50%,var(--border)); background: color-mix(in srgb,var(--warning) 9%,var(--surface)); }
 .feedback { border-color: var(--accent-border); background: var(--accent-soft); color: var(--text-primary); }
 .feedback-error { border-color: color-mix(in srgb,var(--danger) 35%,transparent); background: color-mix(in srgb,var(--danger) 9%,transparent); color: var(--danger); }
+.feedback-warning { border-color: color-mix(in srgb,#f59e0b 35%,transparent); background: color-mix(in srgb,#f59e0b 9%,transparent); color: color-mix(in srgb,#f59e0b 75%,var(--text-primary)); }
+.feedback-success { border-color: color-mix(in srgb,#22c55e 35%,transparent); background: color-mix(in srgb,#22c55e 9%,transparent); color: color-mix(in srgb,#22c55e 75%,var(--text-primary)); }
 .call-banner { border-color: var(--accent-border); background: var(--accent-soft); }
 .call-light { background: var(--focus); box-shadow: 0 0 0 4px var(--accent-soft); }
 
@@ -905,3 +909,6 @@ select { appearance: none; padding-right: 32px !important; background-image: lin
   .entry-form { backdrop-filter: blur(8px); }
 }
 .workspace > p[role="status"] { position: fixed; inset: 0; z-index: 100; display: grid; place-items: center; margin: 0; background: color-mix(in srgb, var(--base) 78%, transparent); color: var(--text); font-size: 13px; pointer-events: none; }
+.image-attachment-button > .attachment-preview { display: grid; grid-column: 1; grid-row: 1; place-items: center; min-height: 68px; padding: 0; font-size: 11px; overflow: hidden; }
+.attachment-list > div { max-width: 100%; min-width: 0; }
+.attachment-list > div > button:not(.message-attachment) { padding: 5px; border: 0; background: transparent; color: var(--text-secondary); font-size: 11px; cursor: pointer; }

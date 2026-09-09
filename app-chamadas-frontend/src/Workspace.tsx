@@ -35,7 +35,7 @@ export default function Workspace({ user, logout, onUser, installer }: { user: A
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission | 'unsupported'>(() => typeof Notification === 'undefined' ? 'unsupported' : Notification.permission);
   const [permissionDismissed, setPermissionDismissed] = useState(false);
   const [installDismissed, setInstallDismissed] = useState(false); const [iosInstallHelp, setIosInstallHelp] = useState(false);
-  const room = useRoom(socket, rooms.selectedId, user, () => { controller.leave('', false); void logout(); }); const activeCall = call.phase !== 'idle'; const connected = room.status === 'connected';
+  const room = useRoom(socket, rooms.selectedId, user, () => { controller.leave('', false); void logout(); }); const activeCall = call.phase !== 'idle'; const activeCallRoom = rooms.rooms.find(item => item.id === call.roomId) ?? null; const connected = room.status === 'connected';
   const { selectedId, loading: roomsLoading, joinRoom, markRead, notify } = rooms;
   const savePreference = preferences.save;
   useEffect(() => { controller.configureDevices(preferences.preferences); }, [controller, preferences.preferences]);
@@ -58,7 +58,7 @@ export default function Workspace({ user, logout, onUser, installer }: { user: A
       let item: Notification;
       try { item = new Notification(title, { body, icon: '/nexa-logo.png', badge: '/favicon.svg', tag, silent: !preferences.preferences.sounds }); }
       catch { return false; }
-      item.onclick = () => { window.focus(); drawer.current?.close(); controller.leave('', true); rooms.setSelectedId(roomId); rooms.markRead(roomId); item.close(); };
+      item.onclick = () => { window.focus(); drawer.current?.close(); rooms.setSelectedId(roomId); rooms.markRead(roomId); item.close(); };
       return true;
     };
     const notification = (value: RoomNotification) => {
@@ -73,12 +73,13 @@ export default function Workspace({ user, logout, onUser, installer }: { user: A
   }, [socket, selectedId, notify, preferences.preferences.sounds, preferences.preferences.doNotDisturb, controller, rooms]);
   useEffect(() => {
     const removed = (event: RoomRemoved) => {
-      if (rooms.selectedId === event.roomId) { controller.leave('', false); setTools(false); }
+      if (call.roomId === event.roomId) controller.leave('', false);
+      if (rooms.selectedId === event.roomId) setTools(false);
       rooms.removeRoom(event.roomId);
       setToast({ kind: event.reason === 'deleted' ? 'warning' : 'info', title: event.reason === 'deleted' ? 'Sala excluída' : 'Você saiu da sala', message: event.reason === 'deleted' ? 'A sala e seus dados foram removidos.' : 'A sala foi removida da sua lista.' });
     };
     socket.on('sala_removida', removed); return () => { socket.off('sala_removida', removed); };
-  }, [controller, rooms, socket]);
+  }, [call.roomId, controller, rooms, socket]);
   useEffect(() => {
     if (roomsLoading) return; const match = window.location.pathname.match(/^\/join\/([A-Z0-9-]+)$/i); if (!match?.[1]) return;
     void joinRoom(match[1]).then(() => { history.replaceState({}, '', '/'); setToast({ kind: 'success', title: 'Convite aceito', message: 'Você entrou na sala pelo convite.' }); }).catch(error => setToast({ kind: 'error', title: 'Não foi possível entrar', message: error.message }));
@@ -87,7 +88,7 @@ export default function Workspace({ user, logout, onUser, installer }: { user: A
     const saved = await savePreference(value); socket.emit('atualizar_status', { status: saved.status }); return saved;
   }, [savePreference, socket]);
   const updateUser = useCallback((value: AuthUser | null) => { onUser(value); if (value) socket.emit('atualizar_perfil'); else socket.disconnect(); }, [onUser, socket]);
-  const selectRoom = (roomId: string) => { drawer.current?.close(); if (roomId === rooms.selectedId) return; controller.leave('', true); rooms.setSelectedId(roomId); rooms.markRead(roomId); };
+  const selectRoom = (roomId: string) => { drawer.current?.close(); if (roomId === rooms.selectedId) return; rooms.setSelectedId(roomId); rooms.markRead(roomId); };
   const doLogout = async () => { controller.leave('', true); socket.disconnect(); await logout(); };
   const requestNotifications = async () => {
     if (typeof Notification === 'undefined') { setNotificationPermission('unsupported'); return; }
@@ -110,10 +111,10 @@ export default function Workspace({ user, logout, onUser, installer }: { user: A
   return <div className="workspace"><aside className="desktop-sidebar"><Sidebar {...sidebarProps} /></aside><dialog ref={drawer} className="mobile-drawer" onClick={event => { if (event.target === event.currentTarget) drawer.current?.close(); }}><Sidebar {...sidebarProps} onClose={() => drawer.current?.close()} /></dialog>
     <main className="main-panel">{installer.available && !installDismissed && <aside className="notification-consent app-install-offer" aria-label="Instalar aplicativo"><span className="notification-consent-icon"><Icon name="download" size={20} /></span><span><strong>Instale o Nexa neste dispositivo</strong><small>Abra em uma janela própria e crie um atalho no sistema.</small></span><button className="primary-button" onClick={() => void installApp()}>{installer.manual ? 'Como instalar' : 'Instalar Nexa'}</button><button className="icon-button" aria-label="Agora não instalar" onClick={() => setInstallDismissed(true)}><Icon name="close" size={16} /></button></aside>}{!toast && !preferences.loading && preferences.preferences.messageNotifications && notificationPermission === 'default' && !permissionDismissed && <aside className="notification-consent" aria-label="Ativar notificações"><span className="notification-consent-icon"><Icon name="bell" size={20} /></span><span><strong>Receba novas mensagens</strong><small>O Nexa pode avisar você mesmo quando esta aba estiver em segundo plano.</small></span><button className="primary-button" onClick={() => void requestNotifications()}>Ativar</button><button className="icon-button" aria-label="Agora não" onClick={() => setPermissionDismissed(true)}><Icon name="close" size={16} /></button></aside>}{rooms.selected ? <><header className="room-header"><button className="icon-button mobile-menu" aria-label="Abrir menu" onClick={() => drawer.current?.showModal()}><Icon name="menu" /></button><div className="room-heading"><Icon name="hash" size={24} /><div><h1>{rooms.selected.name}</h1><p>{rooms.selected.description}</p></div></div><span className="room-code"><small>Código</small><span>{rooms.selected.code}</span></span>
       <button className={`header-tool ${rooms.selected.favorite ? 'is-active' : ''}`} onClick={() => void rooms.favoriteRoom(rooms.selected!.id, !rooms.selected!.favorite)} aria-label="Alternar favorito" data-tooltip="Favorito"><Icon name="star" size={18} /></button><button className={`header-tool ${rooms.selected.notificationsEnabled ? 'is-active' : ''}`} onClick={() => void rooms.notifyRoom(rooms.selected!.id, !rooms.selected!.notificationsEnabled)} aria-label="Alternar notificações" data-tooltip="Notificações"><Icon name="bell" size={18} /></button><button className="secondary-button room-tools-button" onClick={() => setTools(true)}>Convidar e organizar</button><span className={`connection-status ${connected ? 'is-online' : ''}`}><i />{connected ? 'Conectado' : 'Conectando…'}</span>
-      {!activeCall && <button className="primary-button header-call" aria-label={room.roomCall.participants.length ? 'Entrar na chamada' : 'Iniciar chamada'} disabled={!connected || room.roomCall.participants.length >= 15} onClick={() => void controller.join(rooms.selected!.id)}><Icon name="video" size={18} /><span>{room.roomCall.participants.length ? 'Entrar na chamada' : 'Iniciar chamada'}</span></button>}</header>
-      {room.error && <div className="feedback feedback-error"><span>{room.error}</span><button onClick={room.reconnect}>Reconectar</button></div>}{(call.notice || call.error) && <div className={`feedback ${call.error ? 'feedback-error' : ''}`}><span>{call.error || call.notice}</span><button className="icon-button" onClick={controller.dismissNotice}><Icon name="close" size={17} /></button></div>}
-      {!activeCall && room.roomCall.participants.length > 0 && <div className="call-banner"><span className="call-light" /><p><strong>{room.roomCall.participants.map(person => person.displayName).join(', ')}</strong> estão na chamada.</p><span>{room.roomCall.participants.length}/15</span></div>}
-      {activeCall && <Suspense fallback={<p role="status">Preparando chamada…</p>}><VideoCall state={call} controller={controller} username={user.displayName} selfId={socket.id} selfUserId={user.id} selfAvatarUrl={user.avatarUrl} ownerId={rooms.selected.createdBy.id} speakerId={preferences.preferences.speakerId} /></Suspense>}
+      {(!activeCall || call.roomId !== rooms.selected.id) && <button className="primary-button header-call" aria-label={room.roomCall.participants.length ? 'Entrar na chamada' : 'Iniciar chamada'} disabled={!connected || room.roomCall.participants.length >= 15} onClick={() => void controller.join(rooms.selected!.id)}><Icon name="video" size={18} /><span>{room.roomCall.participants.length ? 'Entrar na chamada' : 'Iniciar chamada'}</span></button>}</header>
+      {room.error && <div className="feedback feedback-error"><span>{room.error}</span><button onClick={room.reconnect}>Reconectar</button></div>}{(call.notice || call.error) && <div className={`feedback ${call.error || call.notice?.type === 'error' ? 'feedback-error' : call.notice ? `feedback-${call.notice.type}` : ''}`}><span>{call.error || call.notice?.message}</span><button className="icon-button" onClick={controller.dismissNotice}><Icon name="close" size={17} /></button></div>}
+      {call.roomId !== rooms.selected.id && room.roomCall.participants.length > 0 && <div className="call-banner"><span className="call-light" /><p><strong>{room.roomCall.participants.map(person => person.displayName).join(', ')}</strong> estão na chamada.</p><span>{room.roomCall.participants.length}/15</span></div>}
+      {activeCall && <Suspense fallback={<p role="status">Preparando chamada…</p>}><VideoCall state={call} controller={controller} username={user.displayName} selfId={socket.id} selfUserId={user.id} selfAvatarUrl={user.avatarUrl} ownerId={activeCallRoom?.createdBy.id ?? user.id} speakerId={preferences.preferences.speakerId} /></Suspense>}
       <Chat key={rooms.selected.id} room={rooms.selected} messages={room.messages} ready={connected} userId={user.id} typingUsers={room.typingUsers} hasMore={room.hasMore} loadingEarlier={room.loadingEarlier} onLoadEarlier={room.loadEarlier} onTyping={room.setTyping} send={room.sendMessage} retry={room.retryMessage} edit={room.editMessage} remove={room.deleteMessage} />
     </> : <section className="empty-workspace"><span className="empty-symbol"><Icon name="users" size={34} /></span><h1>{rooms.loading ? 'Carregando suas salas…' : 'Seu espaço começa aqui.'}</h1><p>{rooms.error || 'Crie a primeira sala ou entre com um código de convite.'}</p>{!rooms.loading && <div><button className="primary-button" onClick={() => setDialog('create')}><Icon name="plus" />Criar sala</button><button className="secondary-button" onClick={() => setDialog('join')}><Icon name="enter" />Entrar com código</button></div>}</section>}</main>
     {dialog && <RoomDialog mode={dialog} onClose={() => setDialog(null)} onSubmit={dialog === 'create' ? rooms.createRoom : rooms.joinRoom} />}

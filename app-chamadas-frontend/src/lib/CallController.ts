@@ -1,10 +1,12 @@
 import type { AppSocket } from './socket';
 import { api } from './api';
-import type { CallLeft, CallParticipant, CallReaction, Description, IceCandidate, MediaState, Result, RoomCall, SignalSource } from '../../../shared/protocol';
+import type { CallConnectivity, CallLeft, CallParticipant, CallReaction, Description, IceCandidate, MediaState, Result, RoomCall, SignalSource } from '../../../shared/protocol';
 
 export type CallPhase = 'idle' | 'media' | 'waiting' | 'connecting' | 'connected' | 'reconnecting';
+export interface CallNotice { key: string; type: 'info' | 'warning' | 'success' | 'error'; message: string; persistent: boolean }
 export interface CallState extends MediaState {
   phase: CallPhase;
+  roomId: string | null;
   localStream: MediaStream | null;
   remoteStreams: Record<string, MediaStream>;
   participants: CallParticipant[];
@@ -15,7 +17,7 @@ export interface CallState extends MediaState {
   microphoneBusy: boolean;
   cameraBusy: boolean;
   sharingBusy: boolean;
-  notice: string;
+  notice: CallNotice | null;
   error: string;
 }
 interface PeerContext {
@@ -28,11 +30,12 @@ interface PeerContext {
   handshakeTimer: ReturnType<typeof setTimeout> | null;
 }
 const idleState = (): CallState => ({
-  phase: 'idle', localStream: null, remoteStreams: {}, participants: [], startedAt: null,
+  phase: 'idle', roomId: null, localStream: null, remoteStreams: {}, participants: [], startedAt: null,
   reactions: [], ecoMode: false, quality: 'high',
   microphone: false, camera: false, screen: false,
-  microphoneBusy: false, cameraBusy: false, sharingBusy: false, notice: '', error: '',
+  microphoneBusy: false, cameraBusy: false, sharingBusy: false, notice: null, error: '',
 });
+const CALL_RESUME_KEY = 'nexa.active-call';
 type UserMediaKind = 'camera' | 'microphone';
 function userMediaError(error: unknown, kind: UserMediaKind) {
   const label = kind === 'camera' ? 'câmera' : 'microfone';
@@ -62,6 +65,10 @@ export class CallController {
   private room = '';
   private attemptId = '';
   private callId = '';
+  private recovering = false;
+  private resuming = false;
+  private resumeTimer: ReturnType<typeof setTimeout> | null = null;
+  private repairingPeers = new Set<string>();
   private peers = new Map<string, PeerContext>();
   private cameraStream: MediaStream | null = null;
   private displayStream: MediaStream | null = null;
@@ -70,22 +77,61 @@ export class CallController {
   private deviceChanges: Promise<void> = Promise.resolve();
   private statsTimer: ReturnType<typeof setInterval> | null = null;
   private reactionTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private notices = new Map<string, CallNotice>();
+  private noticeTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private iceServers: RTCIceServer[] = [{ urls: ['stun:stun.cloudflare.com:3478', 'stun:stun.l.google.com:19302'] }];
 
-  constructor(socket: AppSocket) { this.socket = socket; }
+  constructor(socket: AppSocket) {
+    this.socket = socket;
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(CALL_RESUME_KEY) ?? 'null') as { room?: unknown; attemptId?: unknown; savedAt?: unknown } | null;
+      if (saved && typeof saved.room === 'string' && typeof saved.attemptId === 'string' && typeof saved.savedAt === 'number' && Date.now() - saved.savedAt < 60_000) {
+        this.room = saved.room; this.attemptId = saved.attemptId; this.recovering = true;
+        this.state = { ...idleState(), roomId: saved.room, phase: 'reconnecting' };
+      } else sessionStorage.removeItem(CALL_RESUME_KEY);
+    } catch { sessionStorage.removeItem(CALL_RESUME_KEY); }
+  }
   getSnapshot = () => this.state;
   subscribe = (listener: () => void) => { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; };
   private update(patch: Partial<CallState>) { this.state = { ...this.state, ...patch }; this.listeners.forEach(listener => listener()); }
+  private syncNotice() {
+    const priority = (notice: CallNotice) => notice.key === 'local-connection' ? 100 : notice.key === 'local-restored' ? 90
+      : notice.key.startsWith('peer-connection-') ? 80 : notice.key === 'peer-repair' ? 70
+        : notice.key === 'connection-quality' ? 60 : 50;
+    const values = [...this.notices.values()];
+    this.update({ notice: values.sort((first, second) => priority(first) - priority(second)).pop() ?? null });
+  }
+  private clearNotice(key: string) {
+    const timer = this.noticeTimers.get(key); if (timer) clearTimeout(timer);
+    this.noticeTimers.delete(key); this.notices.delete(key); this.syncNotice();
+  }
+  private showNotice(key: string, message: string, type: CallNotice['type'] = 'info', persistent = false, duration = 4_500) {
+    const timer = this.noticeTimers.get(key); if (timer) clearTimeout(timer);
+    this.noticeTimers.delete(key); this.notices.delete(key);
+    this.notices.set(key, { key, message, type, persistent }); this.syncNotice();
+    if (!persistent) this.noticeTimers.set(key, setTimeout(() => this.clearNotice(key), duration));
+  }
+  private clearNotices() {
+    for (const timer of this.noticeTimers.values()) clearTimeout(timer);
+    this.noticeTimers.clear(); this.notices.clear();
+  }
   private current(generation: number) { return generation === this.generation && this.state.phase !== 'idle'; }
   private target(peerId: string) { return { sala: this.room, callId: this.callId, to: peerId }; }
   private participant(peerId: string) { return this.state.participants.find(item => item.socketId === peerId); }
+  private trace(event: string, fields: Record<string, unknown> = {}) {
+    if (import.meta.env.DEV) console.info('[nexa-call]', { event, socketId: this.socket.id ?? null, roomId: this.room || null, callId: this.callId || null, ...fields });
+  }
   private publishMedia() {
     if (this.socket.connected && this.callId) this.socket.emit('atualizar_midia', {
       sala: this.room, attemptId: this.attemptId,
       microphone: this.state.microphone, camera: this.state.camera, screen: this.state.screen,
     });
   }
-  dismissNotice = () => this.update({ error: '', notice: '' });
+  private persistCall() {
+    if (!this.room || !this.attemptId) return;
+    sessionStorage.setItem(CALL_RESUME_KEY, JSON.stringify({ room: this.room, attemptId: this.attemptId, savedAt: Date.now() }));
+  }
+  dismissNotice = () => { this.update({ error: '' }); if (this.state.notice) this.clearNotice(this.state.notice.key); };
   configureDevices = (devices: { cameraId?: string; microphoneId?: string }) => {
     const previous = this.devices;
     this.devices = { cameraId: devices.cameraId ?? '', microphoneId: devices.microphoneId ?? '' };
@@ -108,7 +154,7 @@ export class CallController {
     const oldTrack = kind === 'microphone' ? this.cameraStream?.getAudioTracks()[0] : this.cameraStream?.getVideoTracks()[0];
     // Selecting a device must never acquire media before explicit activation.
     if (!oldTrack || !this.current(generation)) return;
-    if (kind === 'camera' && this.screenOperation) { this.update({ notice: 'Aguarde o compartilhamento terminar de mudar e selecione a câmera novamente.' }); return; }
+    if (kind === 'camera' && this.screenOperation) { this.showNotice('camera-operation', 'Aguarde o compartilhamento terminar de mudar e selecione a câmera novamente.', 'info'); return; }
     this.update(kind === 'microphone' ? { microphoneBusy: true } : { cameraBusy: true });
     let replacement: MediaStreamTrack | undefined;
     const senders = () => [...this.peers.values()].map(peer => kind === 'microphone' ? peer.audioSender : this.displayStream ? null : peer.videoSender).filter((sender): sender is RTCRtpSender => Boolean(sender));
@@ -144,9 +190,10 @@ export class CallController {
     if (context.handshakeTimer) clearTimeout(context.handshakeTimer);
     context.disconnectTimer = null; context.handshakeTimer = null;
   }
-  private closePeer(peerId: string) {
+  private closePeer(peerId: string, reason = 'cleanup') {
     const context = this.peers.get(peerId);
     if (!context) return;
+    this.trace('peer-close', { peerId, reason, connectionState: context.connection.connectionState, iceConnectionState: context.connection.iceConnectionState });
     this.clearPeerTimers(context);
     context.connection.onicecandidate = null;
     context.connection.ontrack = null;
@@ -161,20 +208,30 @@ export class CallController {
     this.update({ remoteStreams });
   }
   leave = (notice = 'Chamada encerrada.', notify = true) => {
+    this.trace('call-teardown', { reason: notify ? 'manual-or-navigation' : 'local-only', notify });
     ++this.generation;
-    if (notify && this.socket.connected && this.attemptId) this.socket.emit('sair_chamada', { sala: this.room, attemptId: this.attemptId });
+    if (this.resumeTimer) clearTimeout(this.resumeTimer);
+    this.resumeTimer = null; this.recovering = false; this.resuming = false;
+    if (notify && this.socket.connected && this.attemptId) {
+      this.trace('manual-leave-emitted');
+      this.socket.emit('sair_chamada', { sala: this.room, attemptId: this.attemptId });
+    }
     for (const peerId of [...this.peers.keys()]) this.closePeer(peerId);
     for (const stream of [this.cameraStream, this.displayStream]) stream?.getTracks().forEach(track => { track.onended = null; track.stop(); });
-    this.peers.clear(); this.cameraStream = null; this.displayStream = null;
+    this.peers.clear(); this.repairingPeers.clear(); this.cameraStream = null; this.displayStream = null;
     if (this.statsTimer) clearInterval(this.statsTimer); this.statsTimer = null;
     for (const timer of this.reactionTimers.values()) clearTimeout(timer); this.reactionTimers.clear();
+    this.clearNotices();
     this.attemptId = ''; this.callId = ''; this.room = ''; this.screenOperation = false;
-    this.update({ ...idleState(), notice });
+    sessionStorage.removeItem(CALL_RESUME_KEY);
+    this.update(idleState());
+    if (notice) this.showNotice('call-ended', notice, 'info');
   };
   private fail(message: string) { this.leave('', true); this.update({ error: message }); }
 
   private updatePhase() {
     if (this.state.phase === 'idle' || this.state.phase === 'media') return;
+    if (this.recovering || !this.socket.connected) { this.update({ phase: 'reconnecting' }); return; }
     if (this.peers.size === 0) { this.update({ phase: 'waiting' }); return; }
     const values = [...this.peers.values()];
     if (values.some(context => context.connection.connectionState === 'connected')) this.update({ phase: 'connected', quality: 'high' });
@@ -210,19 +267,19 @@ export class CallController {
     };
     const onState = () => {
       if (!this.current(generation) || !this.peers.has(peerId)) return;
+      this.trace('peer-state', { peerId, connectionState: connection.connectionState, iceConnectionState: connection.iceConnectionState });
       const failed = connection.connectionState === 'failed' || connection.iceConnectionState === 'failed';
       if (failed || connection.connectionState === 'closed') {
-        const name = this.participant(peerId)?.username ?? 'Um participante';
-        this.closePeer(peerId); this.update({ notice: `${name} perdeu a conexão com a chamada.` }); this.updatePhase(); return;
+        this.repairPeer(peerId, generation, failed ? 'failed' : 'closed'); return;
       }
       if (connection.connectionState === 'disconnected' || connection.iceConnectionState === 'disconnected') {
         this.updatePhase();
         if (!context.disconnectTimer) context.disconnectTimer = setTimeout(() => {
           if (!this.current(generation) || !this.peers.has(peerId)) return;
-          const name = this.participant(peerId)?.username ?? 'Um participante';
-          this.closePeer(peerId); this.update({ notice: `${name} saiu após perder a conexão.` }); this.updatePhase();
-        }, 10_000);
-      } else if (connection.connectionState === 'connected') { this.clearPeerTimers(context); this.updatePhase(); }
+          context.disconnectTimer = null;
+          this.repairPeer(peerId, generation, 'disconnected-timeout');
+        }, 15_000);
+      } else if (connection.connectionState === 'connected') { this.clearPeerTimers(context); this.clearNotice('peer-repair'); this.clearNotice('connection-quality'); this.updatePhase(); }
     };
     connection.onconnectionstatechange = onState;
     connection.oniceconnectionstatechange = onState;
@@ -233,26 +290,59 @@ export class CallController {
     if (!context || context.handshakeTimer) return;
     context.handshakeTimer = setTimeout(() => {
       if (!this.current(generation) || !this.peers.has(peerId)) return;
-      const name = this.participant(peerId)?.username ?? 'um participante';
-      this.closePeer(peerId); this.update({ notice: `Não foi possível conectar com ${name}.` }); this.updatePhase();
+      context.handshakeTimer = null;
+      this.repairPeer(peerId, generation, 'handshake-timeout');
     }, 30_000);
   }
   private queuePeer(peerId: string, task: (context: PeerContext, generation: number) => Promise<void>) {
     const generation = this.generation;
     const context = this.makePeer(peerId, generation);
     context.chain = context.chain.then(async () => { if (this.current(generation) && this.peers.get(peerId) === context) await task(context, generation); }).catch(error => {
-      console.error('Falha na sinalização:', error instanceof Error ? error.name : 'UnknownError');
-      if (this.current(generation) && this.peers.get(peerId) === context) { this.closePeer(peerId); this.update({ notice: 'Não foi possível negociar com um participante.' }); this.updatePhase(); }
+      const reason = error instanceof Error ? error.name : 'UnknownError';
+      console.error('Falha na sinalização:', reason); this.trace('signaling-error', { peerId, reason });
+      if (this.current(generation) && this.peers.get(peerId) === context) {
+        this.closePeer(peerId, 'signaling-error'); this.update({ phase: 'reconnecting' });
+        this.showNotice('peer-repair', 'Tentando restaurar áudio e vídeo…', 'warning', true);
+        setTimeout(() => { if (this.current(generation)) this.repairPeer(peerId, generation, 'signaling-retry'); }, 750);
+      }
     });
   }
   private flushCandidates = async (context: PeerContext, generation: number) => {
     const pending = context.candidates.splice(0);
     for (const candidate of pending) { if (!this.current(generation)) return; await context.connection.addIceCandidate(candidate); }
   };
-  private offerTo(peerId: string) {
+  private repairPeer(peerId: string, generation: number, reason: string) {
+    if (!this.current(generation) || !this.participant(peerId) || this.repairingPeers.has(peerId)) return;
+    if (!this.socket.connected || this.recovering) { const context = this.peers.get(peerId); if (context) this.armHandshake(peerId, generation); return; }
+    this.repairingPeers.add(peerId); this.trace('peer-repair-started', { peerId, reason });
+    this.update({ phase: 'reconnecting', quality: 'low' });
+    this.showNotice('peer-repair', 'Tentando restaurar áudio e vídeo…', 'warning', true);
+    void this.socket.timeout(10_000).emitWithAck('sincronizar_chamada', { sala: this.room, attemptId: this.attemptId }).then((result: Result<RoomCall>) => {
+      if (!this.current(generation)) return;
+      if (!result.ok || result.data.callId !== this.callId) throw new Error(result.ok ? 'call-mismatch' : result.error);
+      const remoteIds = new Set(result.data.participants.filter(user => user.socketId !== this.socket.id).map(user => user.socketId));
+      for (const currentPeer of [...this.peers.keys()]) if (!remoteIds.has(currentPeer)) this.closePeer(currentPeer, 'backend-snapshot');
+      this.update({ participants: result.data.participants, startedAt: result.data.startedAt });
+      if (!remoteIds.has(peerId)) this.clearNotice('peer-repair');
+      for (const remoteId of remoteIds) {
+        const context = this.peers.get(remoteId);
+        if (!context) this.offerTo(remoteId);
+        else if (remoteId === peerId) {
+          if (context.connection.connectionState === 'closed') { this.closePeer(remoteId, 'rebuild-closed'); this.offerTo(remoteId); }
+          else { context.connection.restartIce(); this.offerTo(remoteId, true); }
+        }
+      }
+      this.trace('peer-repair-negotiating', { peerId, participants: result.data.participants.length });
+    }).catch(error => {
+      const failure = error instanceof Error ? error.name || error.message : 'UnknownError';
+      this.trace('peer-repair-failed', { peerId, reason: failure });
+      if (this.current(generation)) setTimeout(() => this.repairPeer(peerId, generation, 'snapshot-retry'), 2_000);
+    }).finally(() => { this.repairingPeers.delete(peerId); });
+  }
+  private offerTo(peerId: string, iceRestart = false) {
     this.queuePeer(peerId, async (context, generation) => {
       this.armHandshake(peerId, generation);
-      const offer = await context.connection.createOffer();
+      const offer = await context.connection.createOffer({ iceRestart });
       if (!this.current(generation)) return;
       await context.connection.setLocalDescription(offer);
       if (this.current(generation)) this.socket.emit('webrtc_offer', { ...this.target(peerId), offer: { type: 'offer', sdp: offer.sdp! } });
@@ -260,10 +350,14 @@ export class CallController {
   }
 
   join = async (sala: string) => {
-    if (this.state.phase !== 'idle' || !this.socket.connected) return;
+    if (this.state.phase !== 'idle') {
+      if (this.room !== sala) this.showNotice('second-call', 'Você já está em uma chamada em outra sala. Saia da chamada atual antes de entrar em outra.', 'warning');
+      return;
+    }
+    if (!this.socket.connected) { this.showNotice('call-offline', 'Aguarde a conexão com o Nexa antes de entrar na chamada.', 'warning'); return; }
     const generation = ++this.generation;
     this.room = sala; this.attemptId = crypto.randomUUID();
-    this.update({ ...idleState(), phase: 'media' });
+    this.clearNotices(); this.update({ ...idleState(), roomId: sala, phase: 'media' });
     try {
       const configuration = await api<{ iceServers: RTCIceServer[] }>('/rtc/ice-servers').catch(() => null);
       if (configuration?.iceServers.length) this.iceServers = configuration.iceServers;
@@ -272,15 +366,20 @@ export class CallController {
       this.cameraStream = stream; this.update({ localStream: stream });
       const result: Result<RoomCall> = await this.socket.timeout(10_000).emitWithAck('entrar_chamada', { sala, attemptId: this.attemptId });
       if (!this.current(generation)) return;
-      if (!result.ok) { this.fail(result.error); return; }
+      if (!result.ok) {
+        if (result.code === 'ALREADY_IN_CALL') { this.leave('', false); this.showNotice('second-call', result.error, 'warning'); }
+        else this.fail(result.error);
+        return;
+      }
       this.callId = result.data.callId!;
-      this.update({ participants: result.data.participants, startedAt: result.data.startedAt, phase: result.data.participants.length > 1 ? 'connecting' : 'waiting' });
+      this.persistCall();
+      this.update({ roomId: sala, participants: result.data.participants, startedAt: result.data.startedAt, phase: result.data.participants.length > 1 ? 'connecting' : 'waiting' });
       this.statsTimer = setInterval(() => void this.monitorQuality(), 8000);
       const remotes = result.data.participants.filter(user => user.socketId !== this.socket.id);
       remotes.forEach(remote => this.offerTo(remote.socketId));
     } catch (error) {
       console.error('Falha ao iniciar chamada:', error);
-      if (this.current(generation)) this.fail('Não foi possível conectar a chamada. Verifique a conexão e tente novamente.');
+      if (this.current(generation) && !this.recovering) this.fail('Não foi possível conectar a chamada. Verifique a conexão e tente novamente.');
     }
   };
   private onDeviceEnded(kind: UserMediaKind, track: MediaStreamTrack, generation: number) {
@@ -288,10 +387,10 @@ export class CallController {
     this.cameraStream?.removeTrack(track);
     if (kind === 'microphone') {
       void Promise.all([...this.peers.values()].map(context => context.audioSender.replaceTrack(null))).catch(() => undefined);
-      this.update({ microphone: false, notice: 'O microfone foi desconectado.' });
+      this.update({ microphone: false }); this.showNotice('microphone-ended', 'O microfone foi desconectado.', 'warning');
     } else {
       if (!this.displayStream) void Promise.all([...this.peers.values()].map(context => context.videoSender?.replaceTrack(null))).catch(() => undefined);
-      this.update({ camera: false, notice: 'A câmera foi desconectada.' });
+      this.update({ camera: false }); this.showNotice('camera-ended', 'A câmera foi desconectada.', 'warning');
     }
     this.publishMedia();
   }
@@ -392,7 +491,9 @@ export class CallController {
     }
     const quality = unstable ? 'low' : 'high';
     if (quality === this.state.quality) return;
-    this.update({ quality, notice: unstable ? 'Conexão instável — qualidade de vídeo reduzida.' : 'A conexão estabilizou — qualidade de vídeo restaurada.' });
+    this.update({ quality });
+    if (unstable) this.showNotice('connection-quality', 'Conexão instável — qualidade de vídeo reduzida.', 'warning', true);
+    else this.clearNotice('connection-quality');
     await this.adjustVideo(unstable ? 550_000 : 1_500_000, unstable ? 1.5 : 1);
   };
   private restoreCamera = async (generation: number) => {
@@ -443,7 +544,10 @@ export class CallController {
   private onOffer = (data: SignalSource & { offer: Description }) => {
     if (!this.validSignal(data)) return;
     this.queuePeer(data.from, async (context, generation) => {
-      if (context.connection.signalingState !== 'stable') return;
+      if (context.connection.signalingState !== 'stable') {
+        if (this.socket.id! < data.from) return;
+        await context.connection.setLocalDescription({ type: 'rollback' });
+      }
       this.armHandshake(data.from, generation); this.updatePhase();
       await context.connection.setRemoteDescription(data.offer);
       if (!this.current(generation)) return;
@@ -485,16 +589,64 @@ export class CallController {
   private onCall = (call: RoomCall) => {
     if (!this.callId || call.callId !== this.callId || call.sala !== this.room) return;
     const remoteIds = new Set(call.participants.filter(user => user.socketId !== this.socket.id).map(user => user.socketId));
-    for (const peerId of this.peers.keys()) if (!remoteIds.has(peerId)) this.closePeer(peerId);
+    for (const peerId of this.peers.keys()) if (!remoteIds.has(peerId)) this.closePeer(peerId, 'backend-snapshot');
     this.update({ participants: call.participants, startedAt: call.startedAt }); this.updatePhase();
+    for (const peerId of remoteIds) if (!this.peers.has(peerId) && (this.socket.id ?? '') > peerId) this.offerTo(peerId);
   };
   private onLeft = (event: CallLeft) => {
     if (event.sala !== this.room || event.callId !== this.callId) return;
-    this.closePeer(event.socketId);
-    this.update({ participants: this.state.participants.filter(user => user.socketId !== event.socketId), notice: `${event.username} saiu da chamada.` });
+    this.trace('peer-left-received', { peerId: event.socketId, reason: event.reason });
+    const leaving = this.participant(event.socketId);
+    this.closePeer(event.socketId, `backend-${event.reason}`);
+    this.clearNotice(`peer-connection-${leaving?.userId ?? event.socketId}`);
+    const notice = event.reason === 'manual' ? `${event.username} saiu da chamada.`
+      : event.reason === 'room-change' ? `${event.username} não participa mais desta sala.`
+        : `${event.username} não conseguiu se reconectar.`;
+    this.update({ participants: this.state.participants.filter(user => user.socketId !== event.socketId) });
+    this.showNotice(`peer-left-${event.socketId}`, notice, event.reason === 'timeout' ? 'warning' : 'info');
     this.updatePhase();
   };
-  private onDisconnect = () => { if (this.state.phase !== 'idle') this.leave('A conexão caiu. Entre novamente na chamada após reconectar.', false); };
+  private onConnectivity = (event: CallConnectivity) => {
+    if (event.sala !== this.room || event.callId !== this.callId || event.socketId === this.socket.id) return;
+    const key = `peer-connection-${event.userId}`;
+    if (event.status === 'reconnecting') this.showNotice(key, `${event.username} perdeu a conexão. Aguardando reconexão…`, 'warning', true);
+    else { this.clearNotice(key); this.showNotice(`peer-restored-${event.userId}`, `${event.username} se reconectou.`, 'success'); }
+  };
+  private onDisconnect = () => {
+    if (this.state.phase === 'idle') return;
+    this.trace('socket-disconnected');
+    this.recovering = true;
+    this.update({ phase: 'reconnecting' });
+    this.showNotice('local-connection', 'Sua conexão caiu. Tentando reconectar…', 'warning', true);
+  };
+  private onConnect = () => { if (this.recovering) void this.resumeCall(); };
+  private resumeCall = async () => {
+    if (!this.recovering || this.resuming || !this.socket.connected || !this.room) return;
+    const generation = this.generation;
+    this.resuming = true;
+    this.trace('socket-resume-started');
+    try {
+      const result: Result<RoomCall> = await this.socket.timeout(10_000).emitWithAck('entrar_chamada', { sala: this.room, attemptId: this.attemptId });
+      if (!this.current(generation)) return;
+      if (!result.ok) {
+        if (result.code === 'ALREADY_IN_CALL') throw new Error('call-still-recovering');
+        this.fail(result.error); return;
+      }
+      for (const peerId of [...this.peers.keys()]) this.closePeer(peerId);
+      this.callId = result.data.callId!; this.recovering = false;
+      this.persistCall();
+      this.trace('socket-resume-confirmed', { participants: result.data.participants.length });
+      this.clearNotice('local-connection');
+      this.update({ roomId: this.room, participants: result.data.participants, startedAt: result.data.startedAt });
+      this.showNotice('local-restored', 'Conexão restabelecida.', 'success');
+      this.publishMedia();
+      result.data.participants.filter(peer => peer.socketId !== this.socket.id).forEach(peer => this.offerTo(peer.socketId));
+      this.updatePhase();
+    } catch (error) {
+      this.trace('socket-resume-retry', { reason: error instanceof Error ? error.name : 'UnknownError' });
+      if (this.current(generation)) this.resumeTimer = setTimeout(() => { void this.resumeCall(); }, 2000);
+    } finally { this.resuming = false; }
+  };
   private onReaction = (reaction: CallReaction) => {
     if (reaction.sala !== this.room || reaction.callId !== this.callId) return;
     this.update({ reactions: [...this.state.reactions, reaction].slice(-12) });
@@ -505,21 +657,22 @@ export class CallController {
     }, 3500);
     this.reactionTimers.set(reaction.id, timer);
   };
-  private onPageHide = () => { this.leave('', true); this.socket.disconnect(); };
   private onPageShow = (event: PageTransitionEvent) => { if (event.persisted) this.socket.connect(); };
+  private onPageHide = () => { if (this.state.phase !== 'idle') this.persistCall(); };
   attach = () => {
     this.socket.on('webrtc_offer', this.onOffer); this.socket.on('webrtc_answer', this.onAnswer);
     this.socket.on('webrtc_ice_candidate', this.onCandidate); this.socket.on('chamada_atualizada', this.onCall);
     this.socket.on('participante_saiu', this.onLeft); this.socket.on('disconnect', this.onDisconnect);
+    this.socket.on('conexao_participante', this.onConnectivity); this.socket.on('connect', this.onConnect);
     this.socket.on('reacao_chamada', this.onReaction);
     window.addEventListener('pagehide', this.onPageHide); window.addEventListener('pageshow', this.onPageShow);
     return () => {
       this.socket.off('webrtc_offer', this.onOffer); this.socket.off('webrtc_answer', this.onAnswer);
       this.socket.off('webrtc_ice_candidate', this.onCandidate); this.socket.off('chamada_atualizada', this.onCall);
       this.socket.off('participante_saiu', this.onLeft); this.socket.off('disconnect', this.onDisconnect);
+      this.socket.off('conexao_participante', this.onConnectivity); this.socket.off('connect', this.onConnect);
       this.socket.off('reacao_chamada', this.onReaction);
       window.removeEventListener('pagehide', this.onPageHide); window.removeEventListener('pageshow', this.onPageShow);
-      this.leave('', true);
     };
   };
 }

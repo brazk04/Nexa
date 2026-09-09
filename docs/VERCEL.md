@@ -92,7 +92,9 @@ npm run db:indexes:postgres
 
 ## Pendências antes de produção
 
-O entrypoint ainda usa `/tmp/nexa-storage` como fallback local. Em produção, `BLOB_READ_WRITE_TOKEN` ou OIDC faz os anexos usarem Vercel Blob privado; avatares já ficam persistidos no banco.
+O entrypoint usa `/tmp/nexa-storage` somente para compatibilidade com arquivos legados. Novos anexos em produção exigem Blob privado; sem autenticação de armazenamento, o envio falha explicitamente. O ID prefixado `NexaBlob_STORE_ID` também é reconhecido para OIDC. Avatares ficam persistidos no banco.
+
+Uploads de imagens, documentos e vídeos MP4/WebM têm limite de 4 MB (4.194.304 bytes), validado antes do envio e no parser multipart. A margem cobre legenda e multipart abaixo dos 4,5 MB da Function. Arquivos antigos já perdidos precisam ser reenviados.
 
 O Socket.IO usa transporte WebSocket direto. Redis é obrigatório na produção para broadcasts, locks de entrada em chamada e recuperação distribuída; mantenha `VITE_SOCKET_TRANSPORTS=websocket` no frontend.
 

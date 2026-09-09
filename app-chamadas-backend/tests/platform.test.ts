@@ -76,7 +76,7 @@ beforeEach(async () => {
   prisma = new PrismaClient({ datasources: { db: { url: `file:${database.replaceAll('\\', '/')}` } } });
   await prisma.emailVerificationToken.deleteMany(); await prisma.session.deleteMany();
   await prisma.mensagem.deleteMany({ where: { roomId: { not: null } } }); await prisma.roomMember.deleteMany(); await prisma.room.deleteMany(); await prisma.user.deleteMany();
-  platform = createPlatform(prisma, { storageRoot: join(folder, 'storage'), sendVerificationEmail: async message => { verificationTokens.set(message.email, message.token); return true; } });
+  platform = createPlatform(prisma, { storageRoot: join(folder, 'storage'), callRecoveryGraceMs: 300, sendVerificationEmail: async message => { verificationTokens.set(message.email, message.token); return true; } });
   await new Promise<void>(resolveListen => platform.server.listen(0, '127.0.0.1', resolveListen));
   const address = platform.server.address(); assert.ok(address && typeof address !== 'string');
   url = `http://127.0.0.1:${address.port}`;
@@ -201,8 +201,23 @@ test('chamada mesh aceita 15, recusa o 16º, roteia sinais e remove somente quem
   const left = event<CallLeftLike>(clients[1], 'participante_saiu');
   const remaining = event<RoomCall>(clients[1], 'chamada_atualizada', value => value.participants.length === 14);
   clients[0].emit('sair_chamada', { sala: room.id, attemptId: calls[0].attemptId });
-  assert.equal((await left).socketId, clients[0].id);
+  const departure = await left; assert.equal(departure.socketId, clients[0].id); assert.equal(departure.reason, 'manual');
   assert.equal((await remaining).callId, calls[0].callId);
+});
+
+test('desconexão técnica aguarda recuperação e só depois confirma timeout', async () => {
+  const alice = await account('AliceGrace'); const bob = await account('BrunoGrace'); const room = await createRoom(alice.cookie);
+  await request('/rooms/join', { code: room.code }, bob.cookie);
+  const a = await client(alice.cookie, room.id); const b = await client(bob.cookie, room.id);
+  const aliceCall = await call(a, room.id); await call(b, room.id);
+  const departures: CallLeftLike[] = []; b.on('participante_saiu', event => departures.push(event));
+  const remaining = event<RoomCall>(b, 'chamada_atualizada', value => value.callId === aliceCall.callId && value.participants.length === 1);
+  a.io.engine.close();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(departures.length, 0, 'não deve anunciar saída durante a janela de recuperação');
+  await remaining;
+  assert.equal(departures.length, 1); assert.equal(departures[0]?.reason, 'timeout');
+  assert.equal((await prisma.callAttendance.findUniqueOrThrow({ where: { callId_userId: { callId: aliceCall.callId, userId: (await prisma.user.findUniqueOrThrow({ where: { usernameNormalized: 'alicegrace' } })).id } } })).leftAt instanceof Date, true);
 });
 
 test('preferências, perfil, favoritos e personalização respeitam persistência e autorização', async () => {
@@ -294,14 +309,19 @@ test('uploads validam conteúdo, exigem associação à sala e removem arquivos 
   assert.equal((await fetch(`${url}/rooms/${room.id}/attachments`, { method: 'POST', headers: { cookie: alice.cookie }, body: invalid })).status, 400);
 });
 
-test('fotos de perfil ficam no banco e continuam disponíveis após nova leitura', async () => {
-  const alice = await account('AliceAvatar');
+test('avatar persistente e versionado aparece em mensagens antigas para usuários offline e novos', async () => {
+  const alice = await account('AliceAvatar'); const bob = await account('BrunoAvatar');
+  const room = await createRoom(alice.cookie, 'Sala Avatar');
+  assert.equal((await request('/rooms/join', { code: room.code }, bob.cookie)).status, 200);
+  const aliceSocket = await client(alice.cookie, room.id);
+  const sent: Result<Message> = await aliceSocket.timeout(4000).emitWithAck('mensagem_chat', { sala: room.id, texto: 'Mensagem anterior à foto', clientMessageId: randomUUID() });
+  assert.equal(sent.ok, true); aliceSocket.disconnect();
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=', 'base64');
   const form = new FormData(); form.append('avatar', new Blob([png], { type: 'image/png' }), 'perfil.png');
   const uploaded = await fetch(`${url}/account/avatar`, { method: 'POST', headers: { cookie: alice.cookie }, body: form });
   assert.equal(uploaded.status, 200);
   const user = (await uploaded.json() as { user: { id: string; avatarUrl: string | null } }).user;
-  assert.ok(user.avatarUrl);
+  assert.match(user.avatarUrl ?? '', new RegExp(`/users/${user.id}/avatar\\?v=\\d+`));
   const stored = await prisma.user.findUnique({ where: { username: 'AliceAvatar' }, select: { avatarPath: true } });
   assert.ok(stored?.avatarPath?.startsWith('data:image/png;base64,'));
   const image = await request(user.avatarUrl!, undefined, alice.cookie);
@@ -309,5 +329,68 @@ test('fotos de perfil ficam no banco e continuam disponíveis após nova leitura
   assert.deepEqual(Buffer.from(await image.arrayBuffer()), png);
   const me = await request('/auth/me', undefined, alice.cookie);
   assert.equal((await me.json() as { user: { avatarUrl: string | null } }).user.avatarUrl, user.avatarUrl);
+  const bobMessages = await request(`/rooms/${room.id}/messages`, undefined, bob.cookie);
+  assert.equal(((await bobMessages.json() as { messages: Message[] }).messages[0]?.avatarUrl), user.avatarUrl);
+  const carla = await account('CarlaAvatar');
+  assert.equal((await request('/rooms/join', { code: room.code }, carla.cookie)).status, 200);
+  const members = await request(`/rooms/${room.id}/members`, undefined, carla.cookie);
+  const member = (await members.json() as { members: { id: string; avatarUrl: string | null }[] }).members.find(item => item.id === user.id);
+  assert.equal(member?.avatarUrl, user.avatarUrl);
+  const carlaMessages = await request(`/rooms/${room.id}/messages`, undefined, carla.cookie);
+  assert.equal(((await carlaMessages.json() as { messages: Message[] }).messages[0]?.avatarUrl), user.avatarUrl);
 });
-interface CallLeftLike { socketId: string }
+interface CallLeftLike { socketId: string; reason: 'manual' | 'room-change' | 'timeout' }
+
+test('uploads bloqueiam tamanho no servidor e validam assinatura de vídeos', async () => {
+  const alice = await account('UploadLimit'); const room = await createRoom(alice.cookie);
+  for (const [name, type, label] of [['large.png', 'image/png', 'A imagem'], ['large.pdf', 'application/pdf', 'O arquivo'], ['large.mp4', 'video/mp4', 'O vídeo']]) {
+    const body = new FormData(); body.append('file', new Blob([new Uint8Array(4 * 1024 * 1024 + 1)], { type }), name);
+    const response = await fetch(`${url}/rooms/${room.id}/attachments`, { method: 'POST', headers: { cookie: alice.cookie }, body });
+    assert.equal(response.status, 413);
+    assert.match((await response.json() as { error: string }).error, new RegExp(`${label}.*4 MB`));
+  }
+  assert.equal(await prisma.attachment.count(), 0);
+  const bad = new FormData(); bad.append('file', new Blob(['not a video'], { type: 'video/mp4' }), 'fake.mp4');
+  assert.equal((await fetch(`${url}/rooms/${room.id}/attachments`, { method: 'POST', headers: { cookie: alice.cookie }, body: bad })).status, 400);
+});
+
+test('repetir entrada na sala e na chamada mantém participantes e histórico', async () => {
+  const alice = await account('RepeatCall'); const room = await createRoom(alice.cookie); const socket = await client(alice.cookie, room.id);
+  const attemptId = randomUUID();
+  const first = await socket.timeout(4000).emitWithAck('entrar_chamada', { sala: room.id, attemptId });
+  assert.ok(first.ok);
+  await socket.timeout(4000).emitWithAck('entrar_sala', { sala: room.id, requestId: randomUUID() });
+  const second = await socket.timeout(4000).emitWithAck('entrar_chamada', { sala: room.id, attemptId });
+  assert.ok(second.ok); assert.equal(second.data.callId, first.data.callId); assert.equal(second.data.participants.length, 1);
+  assert.equal(await prisma.callHistory.count(), 1);
+});
+
+test('chat e chamada usam salas independentes, detectam call tardia e bloqueiam segunda call', async () => {
+  const alice = await account('AliceRooms'); const bob = await account('BrunoRooms');
+  const firstRoom = await createRoom(alice.cookie, 'Sala Um'); const secondRoom = await createRoom(alice.cookie, 'Sala Dois');
+  assert.equal((await request('/rooms/join', { code: firstRoom.code }, bob.cookie)).status, 200);
+  const a = await client(alice.cookie, firstRoom.id); const aliceCall = await call(a, firstRoom.id);
+
+  const b = connect(url, { autoConnect: false, forceNew: true, reconnection: false, extraHeaders: { Cookie: bob.cookie } });
+  sockets.push(b); const connected = event(b, 'connect'); b.connect(); await connected;
+  const requestId = randomUUID();
+  const detected = event<RoomCall>(b, 'chamada_atualizada', value => value.sala === firstRoom.id && value.callId === aliceCall.callId && value.participants.some(item => item.userId === aliceCall.data.participants[0]?.userId));
+  const history = event<History>(b, 'historico_mensagens', value => value.requestId === requestId);
+  assert.equal((await b.timeout(4000).emitWithAck('entrar_sala', { sala: firstRoom.id, requestId })).ok, true);
+  await Promise.all([detected, history]);
+
+  const secondRequestId = randomUUID(); const secondHistory = event<History>(a, 'historico_mensagens', value => value.requestId === secondRequestId);
+  assert.equal((await a.timeout(4000).emitWithAck('entrar_sala', { sala: secondRoom.id, requestId: secondRequestId })).ok, true);
+  await secondHistory;
+  const message: Result<Message> = await a.timeout(4000).emitWithAck('mensagem_chat', { sala: secondRoom.id, texto: 'Chat continua durante a call', clientMessageId: randomUUID() });
+  assert.equal(message.ok, true);
+  const synchronized: Result<RoomCall> = await a.timeout(4000).emitWithAck('sincronizar_chamada', { sala: firstRoom.id, attemptId: aliceCall.attemptId });
+  assert.equal(synchronized.ok, true); if (synchronized.ok) assert.equal(synchronized.data.callId, aliceCall.callId);
+  const blocked: Result<RoomCall> = await a.timeout(4000).emitWithAck('entrar_chamada', { sala: secondRoom.id, attemptId: randomUUID() });
+  assert.equal(blocked.ok, false); if (!blocked.ok) { assert.equal(blocked.code, 'ALREADY_IN_CALL'); assert.match(blocked.error, /outra sala/); }
+  const stillActive: Result<RoomCall> = await a.timeout(4000).emitWithAck('sincronizar_chamada', { sala: firstRoom.id, attemptId: aliceCall.attemptId });
+  assert.equal(stillActive.ok, true); if (stillActive.ok) assert.equal(stillActive.data.callId, aliceCall.callId);
+  const left = event<CallLeftLike>(b, 'participante_saiu', value => value.socketId === a.id);
+  a.emit('sair_chamada', { sala: firstRoom.id, attemptId: aliceCall.attemptId });
+  assert.equal((await left).reason, 'manual');
+});

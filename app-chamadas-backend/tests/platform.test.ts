@@ -351,8 +351,11 @@ test('avatar persistente e versionado aparece em mensagens antigas para usuário
   assert.match(user.avatarUrl ?? '', new RegExp(`/users/${user.id}/avatar\\?v=\\d+`));
   const stored = await prisma.user.findUnique({ where: { username: 'AliceAvatar' }, select: { avatarPath: true } });
   assert.ok(stored?.avatarPath?.startsWith('data:image/png;base64,'));
-  const image = await request(user.avatarUrl!, undefined, alice.cookie);
+  // Browser <img> requests cannot include the bearer token stored by the app.
+  const image = await request(user.avatarUrl!);
   assert.equal(image.status, 200); assert.equal(image.headers.get('content-type'), 'image/png');
+  assert.match(image.headers.get('cache-control') ?? '', /public.*immutable/);
+  assert.equal(image.headers.get('cross-origin-resource-policy'), 'cross-origin');
   assert.deepEqual(Buffer.from(await image.arrayBuffer()), png);
   const me = await request('/auth/me', undefined, alice.cookie);
   assert.equal((await me.json() as { user: { avatarUrl: string | null } }).user.avatarUrl, user.avatarUrl);

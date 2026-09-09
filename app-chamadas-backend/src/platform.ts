@@ -588,17 +588,22 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
     if (previous && !inlineAvatar(previous)) await unlink(join(avatarDirectory, basename(previous))).catch(() => undefined);
     response.json({ user: publicUser(user) });
   });
-  app.get('/users/:id/avatar', requireAuth, async (request, response) => {
+  // Profile photos are rendered by a cross-origin <img>. That element cannot
+  // attach the bearer token used by API requests, so this read-only resource
+  // must be public. The versioned URL prevents stale images after an update.
+  app.get('/users/:id/avatar', async (request, response) => {
     const user = await prisma.user.findUnique({ where: { id: routeId(request.params.id) }, select: { avatarPath: true } });
     if (!user?.avatarPath) { response.status(404).end(); return; }
     try {
       if (inlineAvatar(user.avatarPath)) {
         const match = user.avatarPath.match(/^data:(image\/[a-z0-9.+-]+);base64,([a-z0-9+/=]+)$/i);
         if (!match) { response.status(404).end(); return; }
-        response.type(match[1]!).setHeader('Cache-Control', 'private, max-age=86400, immutable').send(Buffer.from(match[2]!, 'base64')); return;
+        response.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+        response.type(match[1]!).setHeader('Cache-Control', 'public, max-age=31536000, immutable').send(Buffer.from(match[2]!, 'base64')); return;
       }
       const file = join(avatarDirectory, basename(user.avatarPath));
-      response.type(extname(file)).setHeader('Cache-Control', 'private, max-age=86400').send(await readFile(file));
+      response.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
+      response.type(extname(file)).setHeader('Cache-Control', 'public, max-age=86400').send(await readFile(file));
     }
     catch { response.status(404).end(); }
   });

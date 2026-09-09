@@ -18,7 +18,7 @@ try {
   for (const [format, width, height] of formats) {
     const context = await browser.newContext({ viewport: { width, height }, colorScheme: 'dark' });
     const page = await context.newPage();
-    await page.goto(process.argv[2] || 'https://heynexa.vercel.app/');
+    await page.goto(process.argv[2] || 'https://nexa-chi-dusky.vercel.app/');
     await page.evaluate(() => localStorage.removeItem('nexa-landing-language'));
     await page.reload();
     await page.evaluate(() => document.fonts.ready);

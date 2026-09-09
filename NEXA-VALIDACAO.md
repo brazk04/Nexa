@@ -56,7 +56,7 @@ Verificação automatizada do endereço publicado com perfil temporário normal 
 - Frontend: `npm.cmd run build` e `npm.cmd run lint`, ambos concluídos sem erro.
 - Backend: `npm.cmd run build` e `npm.cmd test`; **9 testes passaram**. A publicação também compilou com o Prisma gerado para PostgreSQL.
 - Frontend: `npm.cmd test`; **6 testes passaram**. Cobertura: landing em 320/375/390/430/768/1440/2560px, CTAs e menu; cadastro/verificação/login/logout; isolamento e persistência do chat; notificações, badge e ações de sala; WebRTC com três peers, áudio RTP com energia positiva e elemento remoto não mutado, mute/unmute, troca de câmera/microfone preservando mute, compartilhamento, saída, reconexão com nova entrada; captura pendente cancelada; layout móvel e anexos.
-- `node scripts/verify-pwa.mjs https://heynexa.vercel.app`: manifest, critérios de instalação, controle do service worker e fallback offline.
+- `node scripts/verify-pwa.mjs https://nexa-chi-dusky.vercel.app`: manifest, critérios de instalação, controle do service worker e fallback offline.
 - `node scripts/review-landing.mjs`: capturas para inspeção visual desktop e mobile.
 
 Falhas intermediárias foram usadas para corrigir negociação, reprodução, limites de Suspense e nome acessível do botão móvel. Os resultados acima são da rodada final; não equivalem a teste de dispositivos físicos ou carga de produção.

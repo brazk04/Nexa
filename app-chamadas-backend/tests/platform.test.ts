@@ -17,6 +17,7 @@ let platform: ReturnType<typeof createPlatform>;
 let url: string;
 let sockets: Socket<ServerEvents, ClientEvents>[] = [];
 const verificationTokens = new Map<string, string>();
+const verificationDeliveries: string[] = [];
 
 function event<T>(socket: Socket<ServerEvents, ClientEvents>, name: string, accept: (data: T) => boolean = () => true): Promise<T> {
   return new Promise((resolveEvent, reject) => {
@@ -70,13 +71,18 @@ async function call(socket: Socket<ServerEvents, ClientEvents>, sala: string) {
 
 beforeEach(async () => {
   verificationTokens.clear();
+  verificationDeliveries.length = 0;
   folder = await mkdtemp(join(tmpdir(), 'coworking-integration-'));
   const database = join(folder, 'test.db');
   await copyFile(resolve(__dirname, '../prisma/dev.db'), database);
   prisma = new PrismaClient({ datasources: { db: { url: `file:${database.replaceAll('\\', '/')}` } } });
   await prisma.emailVerificationToken.deleteMany(); await prisma.session.deleteMany();
   await prisma.mensagem.deleteMany({ where: { roomId: { not: null } } }); await prisma.roomMember.deleteMany(); await prisma.room.deleteMany(); await prisma.user.deleteMany();
-  platform = createPlatform(prisma, { storageRoot: join(folder, 'storage'), callRecoveryGraceMs: 300, sendVerificationEmail: async message => { verificationTokens.set(message.email, message.token); return true; } });
+  platform = createPlatform(prisma, { storageRoot: join(folder, 'storage'), callRecoveryGraceMs: 300, sendVerificationEmail: async message => {
+    verificationDeliveries.push(message.email);
+    verificationTokens.set(message.email, message.token);
+    return true;
+  } });
   await new Promise<void>(resolveListen => platform.server.listen(0, '127.0.0.1', resolveListen));
   const address = platform.server.address(); assert.ok(address && typeof address !== 'string');
   url = `http://127.0.0.1:${address.port}`;
@@ -91,6 +97,7 @@ afterEach(async () => {
 test('cadastro valida unicidade, armazena hash, verifica e cria sessão HttpOnly', async () => {
   const first = await request('/auth/register', { username: 'Alice', email: 'alice@example.com', password: 'Senha1234', birthDate: '1990-01-02' });
   assert.equal(first.status, 201);
+  assert.equal(verificationDeliveries.filter(email => email === 'alice@example.com').length, 1);
   const stored = await prisma.user.findUnique({ where: { usernameNormalized: 'alice' } });
   assert.ok(stored); assert.notEqual(stored.passwordHash, 'Senha1234'); assert.equal(await bcrypt.compare('Senha1234', stored.passwordHash), true);
   assert.equal(stored.emailVerifiedAt, null);
@@ -103,6 +110,26 @@ test('cadastro valida unicidade, armazena hash, verifica e cria sessão HttpOnly
   assert.equal(verified.status, 200); assert.match(verified.headers.get('set-cookie') ?? '', /HttpOnly/); assert.match(verified.headers.get('set-cookie') ?? '', /SameSite=Lax/);
   assert.ok((await prisma.user.findUnique({ where: { id: stored.id } }))?.emailVerifiedAt);
   assert.equal((await request('/auth/verify', { token })).status, 400);
+});
+
+test('reenvios simultâneos preservam um único e-mail e um único token válido', async () => {
+  const email = 'dedup@example.com';
+  const credentials = { username: 'Dedup', email, password: 'Senha1234', birthDate: '1990-01-02' };
+  assert.equal((await request('/auth/register', credentials)).status, 201);
+  const originalToken = verificationTokens.get(email);
+  assert.ok(originalToken);
+  await prisma.emailVerificationToken.updateMany({ where: { user: { emailNormalized: email } }, data: { createdAt: new Date(Date.now() - 120_000) } });
+
+  const [first, second] = await Promise.all([
+    request('/auth/resend-verification', { username: credentials.username, password: credentials.password }),
+    request('/auth/resend-verification', { username: credentials.username, password: credentials.password }),
+  ]);
+
+  assert.equal(first.status, 200);
+  assert.equal(second.status, 200);
+  assert.equal(verificationDeliveries.filter(delivery => delivery === email).length, 2);
+  assert.notEqual(verificationTokens.get(email), originalToken);
+  assert.equal(await prisma.emailVerificationToken.count({ where: { user: { emailNormalized: email } } }), 1);
 });
 
 test('salas são persistentes por usuário e acesso por ID é recusado para não membros', async () => {

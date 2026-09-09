@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties, FormEvent } from 'react';
 import { ApiError } from '../lib/api';
 import type { RegisterInput } from '../hooks/useAuth';
@@ -24,6 +24,7 @@ export function AuthScreen({ login, register, verify, resend, initialMode = 'log
   const [error, setError] = useState('');
   const [message, setMessage] = useState(initialToken ? 'Validando seu e-mail…' : '');
   const [backgroundPaused, setBackgroundPaused] = useState(document.visibilityState !== 'visible');
+  const requestInFlight = useRef(Boolean(initialToken));
 
   useEffect(() => {
     const update = () => setBackgroundPaused(document.visibilityState !== 'visible');
@@ -35,14 +36,15 @@ export function AuthScreen({ login, register, verify, resend, initialMode = 'log
     if (!initialToken) return;
     let active = true;
     void verify(initialToken).catch(failure => {
-      if (active) { setError(failure instanceof Error ? failure.message : 'Não foi possível verificar o e-mail.'); setMessage(''); setBusy(false); }
+      if (active) { requestInFlight.current = false; setError(failure instanceof Error ? failure.message : 'Não foi possível verificar o e-mail.'); setMessage(''); setBusy(false); }
     });
     return () => { active = false; };
   }, [initialToken, verify]);
 
   const submit = async (event: FormEvent) => {
     event.preventDefault();
-    if (busy) return;
+    if (busy || requestInFlight.current) return;
+    requestInFlight.current = true;
     setBusy(true); setError(''); setMessage('');
     try {
       if (mode === 'login') await login(username, password);
@@ -54,14 +56,16 @@ export function AuthScreen({ login, register, verify, resend, initialMode = 'log
     } catch (failure) {
       if (failure instanceof ApiError && failure.code === 'EMAIL_UNVERIFIED') setMode('verify');
       setError(failure instanceof Error ? failure.message : 'Não foi possível concluir a operação.');
-    } finally { setBusy(false); }
+    } finally { requestInFlight.current = false; setBusy(false); }
   };
   const resendEmail = async () => {
-    if (!username || !password || busy) { setError('Informe seu nome de usuário e senha para reenviar.'); return; }
+    if (!username || !password) { setError('Informe seu nome de usuário e senha para reenviar.'); return; }
+    if (busy || requestInFlight.current) return;
+    requestInFlight.current = true;
     setBusy(true); setError(''); setMessage('');
     try { setMessage((await resend(username, password)).message); }
     catch (failure) { setError(failure instanceof Error ? failure.message : 'Não foi possível reenviar.'); }
-    finally { setBusy(false); }
+    finally { requestInFlight.current = false; setBusy(false); }
   };
   const changeMode = (next: Mode) => { setMode(next); setError(''); setMessage(''); };
 

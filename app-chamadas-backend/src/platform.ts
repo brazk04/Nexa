@@ -50,9 +50,10 @@ interface RealtimeInfrastructure {
   initialize: (io: Server) => Promise<void>;
   withLock: <T>(key: string, task: () => Promise<T>) => Promise<T>;
 }
-interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string; realtime?: RealtimeInfrastructure; callRecoveryGraceMs?: number }
+interface PlatformOptions { sendVerificationEmail?: VerificationSender; storageRoot?: string; realtime?: RealtimeInfrastructure; callRecoveryGraceMs?: number; verificationCooldownMs?: number }
 const MAX_CALL_PARTICIPANTS = 15;
 const VERIFY_DURATION_MS = 60 * 60 * 1000;
+const VERIFICATION_COOLDOWN_MS = 60_000;
 const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === 'object' && value !== null && !Array.isArray(value);
 const validId = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && value.length <= 100;
 const channelKey = (roomId: string) => `channel:${roomId}`;
@@ -240,19 +241,46 @@ export function createPlatform(prisma: PrismaClient, options: PlatformOptions = 
   });
 
   const sendVerification = options.sendVerificationEmail ?? createVerificationSender();
+  const verificationCooldownMs = options.verificationCooldownMs ?? VERIFICATION_COOLDOWN_MS;
+  const recentVerification = (user: User, target: string, purpose: string) => prisma.emailVerificationToken.findFirst({ where: {
+    userId: user.id,
+    purpose,
+    newEmailNormalized: purpose === 'email-change' ? normalize(target) : null,
+    createdAt: { gte: new Date(Date.now() - verificationCooldownMs) },
+  } });
   async function issueVerification(user: User, target = user.email, purpose = 'registration') {
-    const token = opaqueToken();
-    await prisma.$transaction([
-      prisma.emailVerificationToken.deleteMany({ where: { userId: user.id } }),
-      prisma.emailVerificationToken.create({ data: {
-        tokenHash: tokenHash(token), userId: user.id, purpose,
-        newEmail: purpose === 'email-change' ? target : null,
-        newEmailNormalized: purpose === 'email-change' ? normalize(target) : null,
-        expiresAt: new Date(Date.now() + VERIFY_DURATION_MS),
-      } }),
-    ]);
-    try { return await sendVerification({ email: target, username: user.username, token }); }
-    catch (error) { console.error('Falha ao enviar verificação de e-mail:', error instanceof Error ? error.message : 'erro desconhecido'); return false; }
+    // This durable check is shared by all Vercel instances. The Redis/local
+    // lock closes the small race between checking and creating the token.
+    if (await recentVerification(user, target, purpose)) return true;
+    try {
+      return await withRealtimeLock(`verification:${user.id}`, async () => {
+        if (await recentVerification(user, target, purpose)) return true;
+        const token = opaqueToken();
+        const hashedToken = tokenHash(token);
+        await prisma.$transaction([
+          prisma.emailVerificationToken.deleteMany({ where: { userId: user.id } }),
+          prisma.emailVerificationToken.create({ data: {
+            tokenHash: hashedToken, userId: user.id, purpose,
+            newEmail: purpose === 'email-change' ? target : null,
+            newEmailNormalized: purpose === 'email-change' ? normalize(target) : null,
+            expiresAt: new Date(Date.now() + VERIFY_DURATION_MS),
+          } }),
+        ]);
+        try {
+          const sent = await sendVerification({ email: target, username: user.username, token });
+          if (!sent) await prisma.emailVerificationToken.deleteMany({ where: { tokenHash: hashedToken } });
+          return sent;
+        } catch (error) {
+          await prisma.emailVerificationToken.deleteMany({ where: { tokenHash: hashedToken } }).catch(() => undefined);
+          console.error('Falha ao enviar verificação de e-mail:', error instanceof Error ? error.message : 'erro desconhecido');
+          return false;
+        }
+      });
+    } catch (error) {
+      // Another instance can still own the lock after persisting the token.
+      if (await recentVerification(user, target, purpose)) return true;
+      throw error;
+    }
   }
   const requireAuth = async (request: express.Request, response: express.Response, next: express.NextFunction) => {
     try {

@@ -154,7 +154,14 @@ h1, h2, .primary-button, .workspace-brand strong { font-family: Sora, sans-serif
 .video-tile, .waiting-tile { position: relative; min-width: 0; height: clamp(130px,24vh,260px); border: 1px solid #3c324a; border-radius: 12px; overflow: hidden; background: #17141d; }
 .video-tile video { width: 100%; height: 100%; object-fit: cover; }
 .video-tile.is-sharing { border-color: var(--violet); }
-.video-tile.is-sharing video { object-fit: contain; background: #000; }
+.video-tile.is-sharing video { object-fit: contain; background: #000; cursor: zoom-in; }
+.screen-maximize-button { position: absolute; top: 8px; right: 44px; z-index: 4; display: flex; align-items: center; gap: 6px; min-height: 28px; padding: 5px 9px; border: 1px solid #ffffff35; border-radius: 8px; background: #111018dc; color: #fff; font-size: 11px; backdrop-filter: blur(8px); }
+.screen-maximize-button:hover { border-color: var(--violet-light); background: #262031ee; }
+.video-tile.is-screen-maximized { position: fixed; inset: 0; z-index: 130; width: 100vw; height: 100dvh !important; max-width: none; border: 0; border-radius: 0; background: #000; }
+.video-tile.is-screen-maximized video { object-fit: contain; cursor: zoom-out; }
+.video-tile.is-screen-maximized .pin-button { display: none; }
+.video-tile.is-screen-maximized .screen-maximize-button { top: max(14px,env(safe-area-inset-top)); right: max(14px,env(safe-area-inset-right)); min-height: 40px; padding: 9px 13px; }
+.video-tile.is-screen-maximized .video-caption { bottom: max(14px,env(safe-area-inset-bottom)); left: max(14px,env(safe-area-inset-left)); }
 .video-tile .video-hidden { opacity: 0; }
 .video-placeholder { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 13px; }
 .video-placeholder .avatar { width: 55px; height: 55px; font-size: 17px; border-radius: 18px; }

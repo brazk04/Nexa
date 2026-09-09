@@ -346,6 +346,15 @@ test('WebRTC mesh com três pessoas, compartilhamento tardio, saída isolada e m
     await expect(alice.page.getByText('Conexão restabelecida.', { exact: true })).toHaveCount(0, { timeout: 7_000 });
     await expect(bruno.page.getByText('AliceCall se reconectou.', { exact: true })).toHaveCount(0, { timeout: 7_000 });
     await expect(carla.page.getByText('Compartilhando tela', { exact: true })).toBeVisible();
+    const sharedScreen = carla.page.locator('.video-tile.is-sharing').filter({ hasText: 'AliceCall' });
+    await sharedScreen.getByRole('button', { name: 'Maximizar tela compartilhada', exact: true }).click();
+    await expect(carla.page.locator('.video-tile.is-screen-maximized')).toContainText('AliceCall');
+    const maximizedBox = await carla.page.locator('.video-tile.is-screen-maximized').boundingBox();
+    const viewport = carla.page.viewportSize();
+    expect(maximizedBox?.width).toBe(viewport?.width);
+    expect(maximizedBox?.height).toBe(viewport?.height);
+    await carla.page.keyboard.press('Escape');
+    await expect(carla.page.locator('.video-tile.is-screen-maximized')).toHaveCount(0);
     await expectRemoteAudio(carla.page, 'AliceCall'); await expectRemoteAudio(bruno.page, 'AliceCall');
     await alice.page.getByRole('button', { name: 'Silenciar microfone', exact: true }).click();
     await alice.page.getByRole('button', { name: 'Configurações', exact: true }).click();

@@ -16,7 +16,7 @@ function useSpeaking(stream: MediaStream | null, enabled: boolean) {
     watch(); return () => { cancelAnimationFrame(frame); source.disconnect(); void context.close(); };
   }, [stream, enabled]); return Boolean(stream && enabled && stream.getAudioTracks().length && speaking);
 }
-function VideoTile({ stream, participant, local, pinned, onPin, speakerId }: { stream: MediaStream | null; participant: CallParticipant; local?: boolean; pinned: boolean; onPin: () => void; speakerId?: string }) {
+function VideoTile({ stream, participant, local, pinned, screenMaximized, onPin, onScreenMaximize, speakerId }: { stream: MediaStream | null; participant: CallParticipant; local?: boolean; pinned: boolean; screenMaximized: boolean; onPin: () => void; onScreenMaximize: () => void; speakerId?: string }) {
   const video = useRef<HTMLVideoElement>(null); const audio = useRef<HTMLAudioElement>(null); const [playBlocked, setPlayBlocked] = useState(false); const speaking = useSpeaking(stream, participant.microphone);
   const [videoBlocked, setVideoBlocked] = useState(false);
   useEffect(() => {
@@ -43,12 +43,13 @@ function VideoTile({ stream, participant, local, pinned, onPin, speakerId }: { s
   }, [stream]);
   useEffect(() => { const element = audio.current as (HTMLAudioElement & { setSinkId?: (id: string) => Promise<void> }) | null; if (element?.setSinkId) void element.setSinkId(speakerId || '').catch(() => setPlayBlocked(true)); }, [speakerId]);
   const hidden = !participant.camera && !participant.screen;
-  return <article className={`video-tile ${participant.screen ? 'is-sharing' : ''} ${speaking ? 'is-speaking' : ''} ${pinned ? 'is-pinned' : ''}`} onDoubleClick={onPin}>
-    <video ref={video} autoPlay playsInline muted className={hidden || !stream ? 'video-hidden' : ''} />
+  return <article className={`video-tile ${participant.screen ? 'is-sharing' : ''} ${screenMaximized ? 'is-screen-maximized' : ''} ${speaking ? 'is-speaking' : ''} ${pinned ? 'is-pinned' : ''}`} onDoubleClick={onPin}>
+    <video ref={video} autoPlay playsInline muted className={hidden || !stream ? 'video-hidden' : ''} onClick={participant.screen ? onScreenMaximize : undefined} />
     {!local && <audio ref={audio} autoPlay aria-label={`Áudio de ${participant.displayName}`} />}
     {(hidden || !stream) && <div className="video-placeholder"><Avatar name={participant.displayName} url={participant.avatarUrl} /><span>{stream ? 'Câmera desativada' : 'Aguardando vídeo'}</span></div>}
     {participant.handRaisedAt && <span className="raised-hand" title="Mão levantada"><Icon name="hand" size={18} /></span>}
     <button className="pin-button" onClick={onPin} aria-label={pinned ? 'Desafixar participante' : 'Fixar participante'} data-tooltip={pinned ? 'Desafixar' : 'Fixar'}><Icon name="pin" size={16} /></button>
+    {participant.screen && <button className="screen-maximize-button" onClick={onScreenMaximize} aria-label={screenMaximized ? 'Restaurar tela compartilhada' : 'Maximizar tela compartilhada'}><Icon name={screenMaximized ? 'minimize' : 'maximize'} size={16} /><span>{screenMaximized ? 'Restaurar' : 'Maximizar tela'}</span></button>}
     <div className="video-caption"><strong>{participant.displayName}{local ? ' (você)' : ''}</strong><span>{participant.screen ? 'Compartilhando tela' : !participant.microphone ? 'Microfone desativado' : speaking ? 'Falando' : ''}</span></div>
     {(playBlocked || videoBlocked) && stream && <button className="play-button" onClick={() => {
       void audio.current?.play().then(() => setPlayBlocked(false)).catch(() => setPlayBlocked(true));
@@ -57,17 +58,29 @@ function VideoTile({ stream, participant, local, pinned, onPin, speakerId }: { s
   </article>;
 }
 export function VideoCall({ state, controller, username, selfId, selfUserId, selfAvatarUrl, ownerId, speakerId }: { state: CallState; controller: CallController; username: string; selfId?: string; selfUserId: string; selfAvatarUrl: string | null; ownerId: string; speakerId?: string }) {
-  const [maximized, setMaximized] = useState(false); const [panel, setPanel] = useState(false); const [pinned, setPinned] = useState<string | null>(null); const [, tick] = useState(0);
+  const [maximized, setMaximized] = useState(false); const [maximizedScreen, setMaximizedScreen] = useState<string | null>(null); const [panel, setPanel] = useState(false); const [pinned, setPinned] = useState<string | null>(null); const [, tick] = useState(0);
   useEffect(() => { const timer = setInterval(() => tick(value => value + 1), 1000); return () => clearInterval(timer); }, []);
-  useEffect(() => { const key = (event: KeyboardEvent) => { const target = event.target as HTMLElement; if (target.matches('input, textarea, select, [contenteditable="true"]') || event.ctrlKey || event.metaKey || event.altKey) return; const pressed = event.key.toLowerCase(); if (pressed === 'm') void controller.toggleMicrophone(); if (pressed === 'v') void controller.toggleCamera(); if (pressed === 'h') controller.toggleHand(); if (pressed === 'c') { setMaximized(false); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label^="Mensagem para "]')?.focus()); } if (event.shiftKey && pressed === 'f') { event.preventDefault(); setMaximized(value => !value); } if (event.key === 'Escape') setMaximized(false); }; window.addEventListener('keydown', key); return () => window.removeEventListener('keydown', key); }, [controller]);
+  useEffect(() => { const key = (event: KeyboardEvent) => { const target = event.target as HTMLElement; if (target.matches('input, textarea, select, [contenteditable="true"]') || event.ctrlKey || event.metaKey || event.altKey) return; const pressed = event.key.toLowerCase(); if (pressed === 'm') void controller.toggleMicrophone(); if (pressed === 'v') void controller.toggleCamera(); if (pressed === 'h') controller.toggleHand(); if (pressed === 'c') { setMaximizedScreen(null); setMaximized(false); requestAnimationFrame(() => document.querySelector<HTMLTextAreaElement>('textarea[aria-label^="Mensagem para "]')?.focus()); } if (event.shiftKey && pressed === 'f') { event.preventDefault(); setMaximized(value => !value); } if (event.key === 'Escape') { setMaximizedScreen(null); setMaximized(false); } }; window.addEventListener('keydown', key); return () => window.removeEventListener('keydown', key); }, [controller]);
   const self = state.participants.find(person => person.socketId === selfId) ?? { socketId: selfId ?? 'self', userId: selfUserId, username, displayName: username, avatarUrl: selfAvatarUrl, status: 'online', inCall: true, microphone: state.microphone, camera: state.camera, screen: state.screen, attemptId: '', handRaisedAt: null } satisfies CallParticipant;
   const remotes = state.participants.filter(person => person.socketId !== selfId); const all = [self, ...remotes]; const ready = Boolean(state.localStream && state.phase !== 'media');
+  const activeMaximizedScreen = maximizedScreen && all.some(person => person.socketId === maximizedScreen && person.screen) ? maximizedScreen : null;
+  useEffect(() => {
+    if (!maximizedScreen || activeMaximizedScreen) return;
+    const timer = window.setTimeout(() => setMaximizedScreen(null), 0);
+    return () => window.clearTimeout(timer);
+  }, [maximizedScreen, activeMaximizedScreen]);
+  useEffect(() => {
+    if (!activeMaximizedScreen) return;
+    const previous = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = previous; };
+  }, [activeMaximizedScreen]);
   const effectivePinned = pinned && all.some(person => person.socketId === pinned) ? pinned : null;
   const visible = effectivePinned ? [...all].sort((a, b) => Number(b.socketId === effectivePinned) - Number(a.socketId === effectivePinned)) : all;
   const panelPeople = [...all].sort((a, b) => a.handRaisedAt && b.handRaisedAt ? a.handRaisedAt.localeCompare(b.handRaisedAt) : a.handRaisedAt ? -1 : b.handRaisedAt ? 1 : a.displayName.localeCompare(b.displayName));
   return <section className={`call-panel ${maximized ? 'is-maximized' : ''}`} aria-label="Chamada de vídeo">
     <div className="call-panel-title"><span className="call-light" /><span>{PHASE_LABELS[state.phase]}</span><span className="meeting-timer">{duration(state.startedAt)}</span><span className={`quality quality-${state.quality}`}>{state.ecoMode && <Icon name="leaf" size={14} />}{state.ecoMode ? 'Eco · vídeo reduzido' : `Qualidade ${state.quality === 'high' ? 'alta' : state.quality === 'medium' ? 'média' : 'baixa'}`}</span><span className="call-capacity">{Math.max(1, state.participants.length)}/15</span></div>
-    <div className="call-layout"><div className="video-grid" data-count={visible.length}>{visible.map(person => <VideoTile key={person.socketId} participant={person} local={person.socketId === selfId} stream={person.socketId === selfId ? state.localStream : state.remoteStreams[person.socketId] ?? null} pinned={effectivePinned === person.socketId} speakerId={speakerId} onPin={() => setPinned(value => value === person.socketId ? null : person.socketId)} />)}{remotes.length === 0 && !effectivePinned && <div className="waiting-tile"><Icon name="users" size={30} /><strong>A sala está aberta.</strong><p>Até 14 pessoas podem entrar nesta chamada.</p></div>}</div>
+    <div className="call-layout"><div className="video-grid" data-count={visible.length}>{visible.map(person => <VideoTile key={person.socketId} participant={person} local={person.socketId === selfId} stream={person.socketId === selfId ? state.localStream : state.remoteStreams[person.socketId] ?? null} pinned={effectivePinned === person.socketId} screenMaximized={activeMaximizedScreen === person.socketId} speakerId={speakerId} onPin={() => setPinned(value => value === person.socketId ? null : person.socketId)} onScreenMaximize={() => setMaximizedScreen(value => value === person.socketId ? null : person.socketId)} />)}{remotes.length === 0 && !effectivePinned && <div className="waiting-tile"><Icon name="users" size={30} /><strong>A sala está aberta.</strong><p>Até 14 pessoas podem entrar nesta chamada.</p></div>}</div>
       {panel && <aside className="participants-panel"><header><strong>Participantes</strong><button aria-label="Fechar participantes" onClick={() => setPanel(false)}><Icon name="close" size={16} /></button></header>{panelPeople.map(person => <button key={person.socketId} onClick={() => setPinned(value => value === person.socketId ? null : person.socketId)}><Avatar name={person.displayName} url={person.avatarUrl} small /><span>{person.displayName}{person.socketId === selfId ? ' (você)' : ''}{person.userId === ownerId ? ' · proprietário' : ''}<small>{person.handRaisedAt ? <><Icon name="hand" size={13} /> Mão levantada</> : <><Icon name="mic" size={13} off={!person.microphone} /> {person.microphone ? 'ativo' : 'mutado'} · <Icon name="video" size={13} off={!person.camera} /> {person.camera ? 'ligada' : 'desligada'}</>}</small></span></button>)}</aside>}
     </div>
     <div className="reaction-cloud">{state.reactions.map(reaction => <span key={reaction.id} title={`${reaction.displayName} reagiu com ${reaction.emoji}`}><b>{reaction.emoji}</b><small>{reaction.displayName}</small></span>)}</div>
